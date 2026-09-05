@@ -338,10 +338,14 @@ def build_online_track(item: dict) -> dict:
     # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
     spec_path = f"online/{src}/{guid}.{play_format}"
 
-    artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
+    # Use a resolvable, source-independent entity GUID.  Song GUID suffixes such
+    # as ``online:qq:<mid>:artist`` cannot be parsed by the artist detail routes.
+    artist_guid = f"online:netease:artist:name:{artist}" if artist else ""
+    album_guid = f"online:netease:album:name:{album}" if album else f"{guid}:album"
+    artists_list = [{"name": artist, "guid": artist_guid}] if artist else []
     album_obj = {
         "name": display_album,
-        "guid": f"{guid}:album",
+        "guid": album_guid,
         "artists": artists_list,
         "coverId": guid,
     }
@@ -1524,23 +1528,25 @@ async def load_online_entity_bundle(request: Request, guid: str) -> dict | None:
     client = get_musicbox_client(request.app)
     resolved_guid = guid
     resolved_name = ""
-    if entity_kind == "artist-name":
-        matches = await fetch_musicbox_entity_search(client, raw_id, "artist", 20) or []
+    if entity_kind in {"artist-name", "album-name"}:
+        lookup_kind = entity_kind.split("-", 1)[0]
+        matches = await fetch_musicbox_entity_search(client, raw_id, lookup_kind, 20) or []
+        name_keys = ("artists_name", "artist_name", "name") if lookup_kind == "artist" else ("albums_name", "album_name", "name")
         exact = next(
             (
                 item
                 for item in matches
-                if str(item.get("artists_name") or item.get("name") or "").casefold()
-                == raw_id.casefold()
+                if str(next((item.get(key) for key in name_keys if item.get(key)), "")).casefold() == raw_id.casefold()
             ),
             matches[0] if matches else None,
         )
         if not exact:
             return None
-        resolved_name = str(exact.get("artists_name") or exact.get("name") or raw_id)
-        raw_id = str(exact.get("artist_id") or exact.get("id") or "")
-        entity_kind = "artist"
-        resolved_guid = online_entity_guid("artist", raw_id)
+        resolved_name = str(next((exact.get(key) for key in name_keys if exact.get(key)), raw_id))
+        id_keys = ("artist_id", "id") if lookup_kind == "artist" else ("album_id", "id")
+        raw_id = str(next((exact.get(key) for key in id_keys if exact.get(key)), ""))
+        entity_kind = lookup_kind
+        resolved_guid = online_entity_guid(lookup_kind, raw_id)
 
     endpoint = {
         "artist": f"/api/v1/artist/{raw_id}",
@@ -3217,7 +3223,7 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
     artist_name = vo.get("artist") or ""
     artists_list = [
         {
-            "guid": f"{guid}:artist",
+            "guid": f"online:netease:artist:name:{artist_name}",
             "name": artist_name,
             "coverId": guid,
             "createdAt": ts,
@@ -3226,8 +3232,9 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
     ] if artist_name else []
 
     album_name = vo.get("albumName") or (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "") or ""
+    album_entity_name = str(raw_info.get("album") or vo.get("originalAlbum") or album_name).split(" 〔", 1)[0]
     album_obj = {
-        "guid": f"{guid}:album",
+        "guid": f"online:netease:album:name:{album_entity_name}",
         "name": album_name,
         "artists": artists_list,
         "coverId": guid,
@@ -3669,7 +3676,7 @@ async def online_album_track_list(request: Request):
         or request.query_params.get("guid")
         or ""
     ).strip()
-    return await _online_entity_tracks_response(request, guid, {"album"})
+    return await _online_entity_tracks_response(request, guid, {"album", "album-name"})
 
 
 @app.get("/music/api/v1/album/artist-detail/list")

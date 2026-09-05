@@ -12,6 +12,7 @@ from proxy.app import (
     _ONLINE_ENTITY_CACHE,
     _SEARCH_CACHE,
     artist_directory_name,
+    build_online_track,
     find_cache_file,
     library_basename,
     remember_media_path,
@@ -447,6 +448,31 @@ def test_search_artist_album_playlist_and_open_details():
             params={"playlistGUID": playlist_guid, "page": 1, "size": 50},
         ).json()["data"]
         assert playlist_tracks["total"] == 1
+
+        # Track rows from QQ/Kuwo/Migu use name-based entity GUIDs. Clicking
+        # their artist/album must resolve through the canonical entity search.
+        cross_source = build_online_track({
+            "id": "qq:mid-1",
+            "source": "qq",
+            "title": "晴天",
+            "artist": "周杰伦",
+            "album": "叶惠美",
+        })
+        cross_artist_guid = cross_source["artists"][0]["guid"]
+        assert cross_artist_guid == "online:netease:artist:name:周杰伦"
+        cross_artist = client.get(
+            "/music/api/v1/artist/detail", params={"guid": cross_artist_guid}
+        )
+        assert cross_artist.status_code == 200
+        assert cross_artist.json()["data"]["name"] == "周杰伦"
+
+        cross_album_guid = cross_source["album"]["guid"]
+        assert cross_album_guid == "online:netease:album:name:叶惠美"
+        cross_album = client.get(
+            "/music/api/v1/album/detail", params={"guid": cross_album_guid}
+        )
+        assert cross_album.status_code == 200
+        assert cross_album.json()["data"]["name"] == "叶惠美"
 
 
 def test_metadata_migrates_legacy_root_cache_to_artist_folder():
