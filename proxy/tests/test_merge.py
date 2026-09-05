@@ -16,8 +16,26 @@ from proxy.app import (
     find_cache_file,
     library_basename,
     remember_media_path,
+    repair_track_entity_links,
     write_audio_tags,
 )
+
+
+def test_repair_legacy_cached_track_entity_links():
+    track = {
+        "guid": "online:migu:600908",
+        "artist": "周杰伦",
+        "artists": [{"name": "周杰伦", "guid": "online:migu:600908:artist"}],
+        "album": {
+            "name": "魔杰座 〔咪咕〕",
+            "guid": "online:migu:600908:album",
+            "artists": [{"name": "周杰伦", "guid": "online:migu:600908:artist"}],
+        },
+    }
+    repaired = repair_track_entity_links(track)
+    assert repaired["artists"][0]["guid"] == "online:netease:artist:name:周杰伦"
+    assert repaired["album"]["guid"] == "online:netease:album:name:魔杰座"
+    assert repaired["album"]["artists"][0]["guid"] == "online:netease:artist:name:周杰伦"
 
 
 def _assert_playback_metadata_shape(data: dict, guid: str) -> None:

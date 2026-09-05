@@ -401,6 +401,42 @@ def build_online_track(item: dict) -> dict:
     }
 
 
+def repair_track_entity_links(track: dict) -> dict:
+    """Upgrade persisted daily/favorite tracks created with legacy song suffix links."""
+    if not isinstance(track, dict) or not is_online_guid(str(track.get("guid") or "")):
+        return track
+    artist = str(track.get("artist") or "").strip()
+    artists = track.get("artists")
+    if not artist and isinstance(artists, list) and artists and isinstance(artists[0], dict):
+        artist = str(artists[0].get("name") or "").strip()
+    if artist:
+        artist_guid = online_entity_guid("artist:name", artist)
+        if not isinstance(artists, list) or not artists:
+            track["artists"] = [{"name": artist, "guid": artist_guid}]
+        else:
+            for entry in artists:
+                if isinstance(entry, dict):
+                    entry["guid"] = online_entity_guid(
+                        "artist:name", str(entry.get("name") or artist).strip()
+                    )
+
+    album = track.get("album")
+    album_name = str(track.get("originalAlbum") or "").strip()
+    if isinstance(album, dict):
+        if not album_name:
+            album_name = str(album.get("name") or "").split(" 〔", 1)[0].strip()
+        if album_name:
+            album["guid"] = online_entity_guid("album:name", album_name)
+        album_artists = album.get("artists")
+        if isinstance(album_artists, list) and artist:
+            for entry in album_artists:
+                if isinstance(entry, dict):
+                    entry["guid"] = online_entity_guid(
+                        "artist:name", str(entry.get("name") or artist).strip()
+                    )
+    return track
+
+
 def online_entity_guid(kind: str, raw_id: Any) -> str:
     return f"online:netease:{kind}:{raw_id}"
 
@@ -3479,7 +3515,7 @@ async def favorite_track_list(request: Request):
         if isinstance(t, dict):
             # 确保关键属性为最新或格式完整
             t["isFavorite"] = True
-            online_tracks.append(t)
+            online_tracks.append(repair_track_entity_links(t))
         else:
             g = it.get("guid") or ""
             if g:
@@ -3831,7 +3867,11 @@ async def playlist_track_list(request: Request):
     if not is_authed and auth_resp is not None:
         return auth_resp
     bundle = await _load_daily_bundle(request, user_guid)
-    tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    tracks = [
+        repair_track_entity_links(track)
+        for track in dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+        if isinstance(track, dict)
+    ]
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
