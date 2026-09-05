@@ -544,7 +544,7 @@ fnmusic_ext/
 | `FNMUSIC_MUSICDL_URL` | `http://127.0.0.1:8768` | musicdl 共享音源服务地址 |
 | `FNMUSIC_QQMUSIC_ENABLED` | `false` | 是否启用 QQ 音乐；安装向导选择 `qqmusic` 时写为 `true` |
 | `FNMUSIC_QQMUSIC_URL` | `http://127.0.0.1:8771` | QQ 音乐服务地址 |
-| `FNMUSIC_QQMUSIC_SEARCH_LIMIT` | `100` | QQ 音乐单次搜索上限 |
+| `FNMUSIC_QQMUSIC_SEARCH_LIMIT` | `50` | QQ 音乐单次搜索上限（上游稳定值） |
 | `FNMUSIC_QQMUSIC_QUALITY` | `F000` | QQ 首选音质；无权益时自动降级 |
 | `FNMUSIC_LX_SOURCE_ENABLED` | `false` | 是否启用洛雪脚本播放兜底 |
 | `FNMUSIC_LX_SOURCE_URL` | `http://127.0.0.1:8772` | 洛雪脚本运行服务地址 |

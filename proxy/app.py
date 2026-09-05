@@ -56,7 +56,7 @@ CONF = {
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "100")),
     "musicdl_search_limit": int(os.environ.get("FNMUSIC_MUSICDL_SEARCH_LIMIT", "100")),
-    "qqmusic_search_limit": int(os.environ.get("FNMUSIC_QQMUSIC_SEARCH_LIMIT", "100")),
+    "qqmusic_search_limit": int(os.environ.get("FNMUSIC_QQMUSIC_SEARCH_LIMIT", "50")),
     "qqmusic_quality": os.environ.get("FNMUSIC_QQMUSIC_QUALITY", "F000"),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
     "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "100")),
