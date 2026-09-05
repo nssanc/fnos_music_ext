@@ -14,7 +14,7 @@ RUN test "$(cat .fnmusic-ref)" = "$QQMUSIC_REF" \
 FROM node:22-alpine
 RUN addgroup -S fnmusic && adduser -S -G fnmusic fnmusic
 WORKDIR /app
-COPY --from=build /src /app
+COPY --from=build --chown=fnmusic:fnmusic /src /app
 RUN mkdir -p /data && chown -R fnmusic:fnmusic /data
 USER fnmusic
 ENV PORT=8000 PLATFORM=android DEVICE_PATH=/data/device.json CREDENTIAL_PATH=/data/credential.json
