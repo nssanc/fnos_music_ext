@@ -44,9 +44,10 @@ CONF = {
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "2.5")),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
-    "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
+    "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "100")),
+    "musicdl_search_limit": int(os.environ.get("FNMUSIC_MUSICDL_SEARCH_LIMIT", "30")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
-    "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "30")),
+    "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "100")),
     "search_list_path": os.environ.get("FNMUSIC_SEARCH_LIST_PATH", "data.list"),
     "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
@@ -1090,11 +1091,11 @@ def merge_online_tracks(
             continue
         filtered_online.append(online_item)
 
-    online_limit = CONF["online_limit"]
-    if page == 1:
-        page_online = filtered_online[:online_limit]
-    else:
-        page_online = filtered_online[online_limit + (page - 2) * size : online_limit + (page - 1) * size]
+    # Keep the upstream page size so the client can continue requesting pages.
+    # FNMUSIC_ONLINE_LIMIT is a safety cap per page, not a first-page-only cap.
+    online_page_size = min(size, max(int(CONF["online_limit"]), 1))
+    start = (page - 1) * online_page_size
+    page_online = filtered_online[start : start + online_page_size]
 
     for it in page_online:
         target_list.append(build_online_track(it))
@@ -1434,7 +1435,7 @@ async def search_track(request: Request):
             )
         if CONF.get("musicdl_enabled", True):
             mdl_task = asyncio.create_task(
-                fetch_musicdl_search(musicdl_client, keyword, CONF["online_limit"])
+                fetch_musicdl_search(musicdl_client, keyword, CONF["musicdl_search_limit"])
             )
 
         async def _bg_aggregator(e: dict, t_mb: asyncio.Task | None, t_mdl: asyncio.Task | None):

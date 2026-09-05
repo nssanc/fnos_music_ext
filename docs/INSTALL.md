@@ -133,6 +133,10 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 # 示例 1：推荐配置 —— Docker 模式 + 双音源 + 自动启用
 ./install.sh --non-interactive --mode docker --sources musicdl,musicbox --extend
 
+# 当前管理员没有 /var/run/docker.sock 权限时，显式允许长期修复
+./install.sh --non-interactive --mode docker --sources musicdl,musicbox \
+  --fix-docker-permissions --extend
+
 # 示例 2：纯净轻量 —— Host 宿主机模式 + 仅 musicdl 音源
 ./install.sh --non-interactive --mode host --sources musicdl --extend
 
@@ -143,6 +147,24 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
   --llm-model 'gpt-4o-mini' \
   --extend
 ```
+
+---
+
+### Docker 权限排障
+
+安装器会调用 `docker info` 验证 daemon 权限。若当前账号不在 `docker` 组，交互模式
+会征求确认；非交互模式必须添加 `--fix-docker-permissions`。修复后请重新登录 SSH，
+再运行 `docker info` 验证。注意：`docker` 组拥有接近 root 的主机控制权限。
+
+Docker 镜像构建使用 `.env` 中的 `PIP_INDEX_URL`。默认安装器使用阿里云镜像；如需
+使用官方 PyPI，可在安装时运行：
+
+```bash
+PIP_INDEX=https://pypi.org/simple ./install.sh --mode docker
+```
+
+安装器会记录 `FNMUSIC_INSTALL_MODE`，后续 `extend.sh` 只启动所选运行方式，并自动
+停用占用相同端口的旧容器或 systemd 音源服务。
 
 ---
 

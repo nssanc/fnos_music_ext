@@ -949,8 +949,9 @@ async def test_resolve_online_lyric_netease(tmp_path, monkeypatch):
 
 
 def test_search_volume_and_default_limits(monkeypatch):
-    """搜索量：断言 fetch_musicbox_search 请求参数 limit=50（netease_search_limit），page=1 在线条目最多 30 条。"""
+    """搜索量：按请求页大小分页，不再把第一页在线条目硬限制为 30 条。"""
     captured_limits = []
+    monkeypatch.setitem(CONF, "online_limit", 100)
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
@@ -997,12 +998,12 @@ def test_search_volume_and_default_limits(monkeypatch):
         resp = client.get("/music/api/v1/search/track?q=测试&page=1&size=50")
         assert resp.status_code == 200
         data = resp.json()["data"]
-        # netease_search_limit = 50
+        # fixture 中 netease_search_limit = 50
         assert "50" in captured_limits
-        # online_limit = 30，第一页最多 30 条在线
-        assert len(data["list"]) == 30
+        # 请求 size=50，返回全部 40 条，不再截断为 30 条
+        assert len(data["list"]) == 40
         assert data["list"][0]["guid"] == "online:netease:mb_1"
-        assert data["list"][29]["guid"] == "online:netease:mb_30"
+        assert data["list"][39]["guid"] == "online:netease:mb_40"
         # total 为 40
         assert data["total"] == 40
 

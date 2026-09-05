@@ -1,5 +1,7 @@
 FROM python:3.13-slim
 
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
@@ -16,7 +18,7 @@ RUN apt-get update \
 
 # Install requirements
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt
 
 # Copy application source code
 COPY app.py /app/app.py

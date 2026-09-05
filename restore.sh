@@ -123,9 +123,14 @@ fi
 # 5. full 模式额外清理音源
 if [ "${FULL_RESTORE}" -eq 1 ]; then
     log_info "(--full 模式) 停止并移除音源容器与宿主机 unit..."
-    docker rm -f fnmusic-musicdl fnmusic-musicbox 2>/dev/null || true
+    docker rm -f fnmusic-musicdl fnmusic-musicbox 2>/dev/null \
+        || sudo docker rm -f fnmusic-musicdl fnmusic-musicbox 2>/dev/null \
+        || true
     sudo systemctl disable --now fnmusic-musicdl.service 2>/dev/null || true
     sudo systemctl disable --now fnmusic-musicbox.service 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/fnmusic-musicdl.service \
+        /etc/systemd/system/fnmusic-musicbox.service
+    sudo systemctl daemon-reload 2>/dev/null || true
     log_info "musicdl / musicbox 已停止。"
 else
     log_info "默认保留音源容器/unit 与 cache/ 目录。"

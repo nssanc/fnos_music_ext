@@ -524,11 +524,12 @@ fnmusic_ext/
 | `FNMUSIC_MUSICBOX_URL` | `http://127.0.0.1:8770` | 网易云 (musicbox) 服务地址 |
 | `FNMUSIC_NETEASE_ENABLED` | `true` | 是否启用网易云 / musicbox 音源 |
 | `FNMUSIC_NETEASE_WAIT_S` | `2.5` | 第 1 页搜索网易云快速等待超时（秒） |
-| `FNMUSIC_NETEASE_SEARCH_LIMIT` | `50` | 网易云搜索单次最大抓取条数 |
+| `FNMUSIC_NETEASE_SEARCH_LIMIT` | `100` | 网易云搜索单次最大抓取条数 |
+| `FNMUSIC_MUSICDL_SEARCH_LIMIT` | `30` | musicdl 每个来源单次最大抓取条数 |
 | `FNMUSIC_NETEASE_QUALITY` | `lossless` | 网易云音频音质偏好（`lossless` 无损 / `exhigh` / `standard`） |
 | `FNMUSIC_MUSICDL_URL` | `http://127.0.0.1:8768` | musicdl 共享音源服务地址 |
 | `FNMUSIC_UPSTREAM_SOCK` | `/var/run/trim_music_upstream.socket` | 飞牛音乐原生 Unix Socket 路径 |
-| `FNMUSIC_ONLINE_LIMIT` | `30` | 默认在线合并返回条目数限制 |
+| `FNMUSIC_ONLINE_LIMIT` | `100` | 每页在线合并安全上限；实际按前端请求的 `size` 持续分页 |
 | `FNMUSIC_SEARCH_CACHE_TTL` | `300` | 搜索聚合缓存有效期（秒） |
 | `FNMUSIC_CACHE_DIR` | `$FNMUSIC_HOME/cache` | 在线音频 Tee 缓存落盘目录 |
 | `FNMUSIC_FAV_DIR` | `$FNMUSIC_HOME/online_favorites/` | 多用户在线收藏存储目录 |
@@ -596,6 +597,10 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 # 推荐组合：Docker 模式 + 双音源 + 安装完成后立即接管
 ./install.sh --non-interactive --mode docker --sources musicdl,musicbox --extend
 
+# 若当前账号尚无 Docker socket 权限，可明确授权安装器做长期修复
+./install.sh --non-interactive --mode docker --sources musicdl,musicbox \
+  --fix-docker-permissions --extend
+
 # 纯净组合：Host 宿主机模式 + 双音源 + 立即接管
 ./install.sh --non-interactive --mode host --sources musicdl,musicbox --extend
 
@@ -623,6 +628,23 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 更多详细技术与人工安装文档：
 - 详细人工安装指南：[docs/INSTALL.md](docs/INSTALL.md)
 - 供 AI Agent 自动部署的提示词：[docs/AGENT_INSTALL.md](docs/AGENT_INSTALL.md)
+
+### Docker 权限与国内镜像
+
+安装器会实际连接 Docker daemon，而不只是检查 `docker` 命令是否存在。如果出现
+`/var/run/docker.sock: permission denied`，交互模式会询问是否将当前管理员加入
+`docker` 组；非交互模式需显式添加 `--fix-docker-permissions`。组权限在重新登录 SSH
+后永久生效，本次安装会通过 `sudo` 安全完成。
+
+Docker 组拥有接近 root 的主机控制权限，请只授予可信管理员。镜像构建默认沿用安装器
+的国内 PyPI 源，也可自定义：
+
+```bash
+PIP_INDEX=https://pypi.org/simple ./install.sh --mode docker
+```
+
+在 Docker 与 Host 模式之间切换时，安装器会先停用另一种运行方式，避免
+`8768`/`8770` 端口冲突。
 
 ---
 
@@ -739,4 +761,3 @@ python3 -m py_compile proxy/app.py proxy/recommend.py
 - 使用者在下载、部署或运行本项目前，应充分知悉并自愿遵守所在国家/地区的法律法规，以及第三方服务平台的用户协议。
 - **风险自担**：由于使用者滥用、恶意传播、商业化使用或不当配置本项目而导致的一切法律责任、版权纠纷、账号封禁、IP 拦截或连带经济损失，**概由使用者本人自行承担全部责任**，本项目发起人、维护者及社区贡献者不承担任何直接、间接或连带的法律责任。
 - **权利人联系通道**：若相关版权权利人认为本项目的代码实现或接口中继涉嫌侵犯其合法权益，请通过 GitHub Issue 或电子邮件向项目维护团队提交权属证明通知。我们将在收到通知并核实后的第一时间积极配合，并及时下架、修改或删除涉嫌侵权的代码与功能。
-

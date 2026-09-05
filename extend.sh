@@ -12,6 +12,7 @@ TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 MUSICDL_URL="http://127.0.0.1:8768"
 MUSICBOX_URL="http://127.0.0.1:8770"
+INSTALL_MODE="auto"
 
 log_info() {
     echo -e "\033[32m[INFO]\033[0m $*"
@@ -58,6 +59,7 @@ source "${BASE_DIR}/.env"
 set +a
 MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
+INSTALL_MODE="${FNMUSIC_INSTALL_MODE:-auto}"
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
 is_enabled "${FNMUSIC_MUSICDL_ENABLED:-true}" && ENABLE_MUSICDL=1
@@ -274,19 +276,62 @@ if [ ! -S "${TARGET_SOCK}" ] && [ ! -S "${UPSTREAM_SOCK}" ]; then
 fi
 
 # 1.4 检查 / 自动拉起已启用的音源
+docker_cmd() {
+    if docker info >/dev/null 2>&1; then
+        docker "$@"
+    else
+        sudo -n docker "$@"
+    fi
+}
+
 ensure_source() {
     local name="$1" url="$2" compose_svc="$3" unit="$4"
+    # The two runtimes bind the same ports and must never run together.
+    case "${INSTALL_MODE}" in
+        docker)
+            sudo systemctl disable --now "${unit}" 2>/dev/null || true
+            ;;
+        host)
+            docker rm -f "fnmusic-${compose_svc}" >/dev/null 2>&1 \
+                || sudo -n docker rm -f "fnmusic-${compose_svc}" >/dev/null 2>&1 \
+                || true
+            ;;
+    esac
     if curl -sf --max-time 5 "${url}/healthz" >/dev/null 2>&1; then
         log_info "${name} 已就绪 (${url}/healthz)。"
         return 0
     fi
     log_warn "${name} 未就绪，正在拉起..."
-    if command -v docker >/dev/null 2>&1; then
-        docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}" || true
-    fi
-    if systemctl list-unit-files "${unit}" >/dev/null 2>&1; then
-        sudo systemctl start "${unit}" 2>/dev/null || true
-    fi
+    case "${INSTALL_MODE}" in
+        docker)
+            if ! command -v docker >/dev/null 2>&1; then
+                log_err "配置为 Docker 模式，但未找到 docker 命令。"
+                return 1
+            fi
+            if ! docker_cmd compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}"; then
+                log_err "${name} Docker 容器启动失败。"
+                return 1
+            fi
+            ;;
+        host)
+            if [ ! -f "/etc/systemd/system/${unit}" ]; then
+                log_err "配置为 Host 模式，但未找到 ${unit}。请重新运行 ./install.sh --mode host。"
+                return 1
+            fi
+            sudo systemctl start "${unit}"
+            ;;
+        *)
+            log_warn "旧配置未记录安装模式，按现有运行组件自动判断。建议重新运行 ./install.sh。"
+            if [ -f "/etc/systemd/system/${unit}" ] && systemctl is-enabled --quiet "${unit}" 2>/dev/null; then
+                sudo systemctl start "${unit}"
+            elif command -v docker >/dev/null 2>&1; then
+                docker_cmd compose -f "${BASE_DIR}/docker-compose.yml" up -d --build "${compose_svc}"
+            else
+                log_err "无法确定或启动 ${name} 的运行组件。"
+                return 1
+            fi
+            ;;
+    esac
     local i
     for i in $(seq 1 60); do
         if curl -sf --max-time 3 "${url}/healthz" >/dev/null 2>&1; then
