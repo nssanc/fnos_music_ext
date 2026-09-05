@@ -478,6 +478,8 @@ def test_search_artist_album_playlist_and_open_details():
         })
         cross_artist_guid = cross_source["artists"][0]["guid"]
         assert cross_artist_guid == "online:netease:artist:name:周杰伦"
+        assert isinstance(cross_source["createdAt"], int)
+        assert isinstance(cross_source["updatedAt"], int)
         cross_artist = client.get(
             "/music/api/v1/artist/detail", params={"guid": cross_artist_guid}
         )

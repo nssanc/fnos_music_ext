@@ -335,6 +335,15 @@ def build_online_track(item: dict) -> dict:
     except (TypeError, ValueError):
         file_size = 0
     cover = str(item.get("cover_url") or "")
+    now = int(time.time())
+    try:
+        created_at = int(item.get("createdAt") or item.get("created_at") or now)
+    except (TypeError, ValueError):
+        created_at = now
+    try:
+        updated_at = int(item.get("updatedAt") or item.get("updated_at") or created_at)
+    except (TypeError, ValueError):
+        updated_at = created_at
     # 路径带真实后缀，飞牛 ll() 用 path 解析 extension；封面走 guid 以便 /static/cover 拦截
     spec_path = f"online/{src}/{guid}.{play_format}"
 
@@ -398,6 +407,8 @@ def build_online_track(item: dict) -> dict:
         "hasLyric": bool(item.get("lyric")),
         "genres": [],
         "accessStatus": 0,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
     }
 
 
