@@ -27,6 +27,27 @@ def test_extract_qq_tracks_handles_nested_mobile_shape():
     assert tracks[0]["cover_url"].endswith("000MkMni19ClKG.jpg")
 
 
+def test_extract_qq_tracks_handles_current_item_song_shape():
+    payload = {
+        "code": 0,
+        "data": {
+            "body": {
+                "item_song": [{
+                    "mid": "0039MnYb0qxYhV",
+                    "name": "晴天",
+                    "interval": 269,
+                    "singer": [{"name": "周杰伦"}],
+                    "album": {"name": "叶惠美", "mid": "000MkMni19ClKG"},
+                    "file": {"size_flac": 123},
+                }]
+            }
+        },
+    }
+    tracks = extract_qq_tracks(payload)
+    assert len(tracks) == 1
+    assert tracks[0]["id"] == "qq:0039MnYb0qxYhV"
+
+
 def test_qq_play_url_and_lx_aliases():
     assert qq_play_url({"data": {"mid1": {"url": "https://cdn.test/a.flac", "size": 9}}}, "mid1") == ("https://cdn.test/a.flac", 9)
     assert lx_source_key("qq") == "tx"

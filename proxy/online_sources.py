@@ -18,7 +18,7 @@ def extract_qq_tracks(payload: Any) -> list[dict]:
     """Find the song list across QQ API mobile/web response variants."""
     candidates: list[list] = []
     for obj in _walk_dicts(payload):
-        for key in ("list", "items", "itemlist", "songlist", "tracks"):
+        for key in ("list", "items", "itemlist", "item_song", "songlist", "tracks"):
             value = obj.get(key)
             if not isinstance(value, list) or not value:
                 continue
