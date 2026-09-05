@@ -131,10 +131,10 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
 ```bash
 # 示例 1：推荐配置 —— Docker 模式 + 双音源 + 自动启用
-./install.sh --non-interactive --mode docker --sources musicdl,musicbox --extend
+./install.sh --non-interactive --mode docker --sources musicdl,musicbox,qqmusic,lx --extend
 
 # 当前管理员没有 /var/run/docker.sock 权限时，显式允许长期修复
-./install.sh --non-interactive --mode docker --sources musicdl,musicbox \
+./install.sh --non-interactive --mode docker --sources musicdl,musicbox,qqmusic,lx \
   --fix-docker-permissions --extend
 
 # 示例 2：纯净轻量 —— Host 宿主机模式 + 仅 musicdl 音源

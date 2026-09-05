@@ -6,12 +6,15 @@ This project sits in front of fnOS Music (`trim.music`). Treat it as production 
 
 - Never commit `.env`, API keys, tokens, or password hashes.
 - Daily recommend credentials live only in `.env` (`chmod 600`) and are loaded via systemd `EnvironmentFile`. They are not logged.
+- QQ Music accepts QR authorization only through the extension UI; account passwords are never accepted. Session credentials stay in the dedicated QQ service data volume/file and are never returned by the proxy.
+- LX custom-source scripts are executable code. Import only trusted scripts. Docker mode runs them as a non-root user with dropped capabilities, a read-only root filesystem, and a dedicated data volume; Host mode uses a sandboxed dynamic systemd user.
 - Report leaked keys by rotating them at the provider; do not paste keys into issues.
 
 ## What this project must not do
 
 - Do not modify fnOS nginx configs (the system rewrites them).
 - Do not patch `trim-music` binaries or write to the official `music.db`.
+- The optional settings UI hook may only add/remove the marked `fnmusic-ext-ui` script/link block in the Music app HTML; it must never replace the full file or edit nginx configuration.
 - Do not disable fail-safe: if the proxy dies, official music must still work after `restore.sh` or automatic socket reclaim.
 
 ## Reporting

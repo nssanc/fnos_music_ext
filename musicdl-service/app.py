@@ -40,7 +40,7 @@ CONF = {
         if s.strip()
     ],
     "search_timeout": float(os.environ.get("MUSICDL_SEARCH_TIMEOUT", "12")),
-    "limit_per_source": int(os.environ.get("MUSICDL_LIMIT_PER_SOURCE", "10")),
+    "limit_per_source": int(os.environ.get("MUSICDL_LIMIT_PER_SOURCE", "100")),
     "url_ttl": int(os.environ.get("MUSICDL_URL_TTL", "1800")),
     "cache_max": int(os.environ.get("MUSICDL_CACHE_MAX", "3000")),
     "work_dir": os.environ.get("MUSICDL_WORK_DIR", "/tmp/musicdl_outputs"),
@@ -295,7 +295,7 @@ async def sources():
 @app.get("/search")
 async def search(
     keyword: str = Query(..., min_length=1),
-    limit: int = Query(None, ge=1, le=30),
+    limit: int = Query(None, ge=1, le=100),
     sources: str = Query("", description="逗号分隔的源名(短名或全名)，空=用默认白名单"),
 ):
     if limit is None:

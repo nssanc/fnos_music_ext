@@ -2,7 +2,7 @@
 
 `fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）量身定制的无侵入式扩展代理。通过 Unix Domain Socket 接管官方后端入口，为飞牛原生客户端无缝提供全网在线聚合搜索、流式播放、歌词与封面解析、边播边落盘，以及基于大模型的每日推荐歌单。
 
-可选音源支持：[musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等）、[musicbox](https://github.com/darknessomi/musicbox)（网易云高品质）。本项目完全不修改飞牛官方 nginx 配置、不 Patch 官方二进制、不改动官方数据库。
+可选音源支持：[musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等）、[musicbox](https://github.com/darknessomi/musicbox)（网易云高品质）、QQ 音乐扫码登录与会员音质，以及兼容[洛雪自定义源脚本](https://lxmusic.toside.cn/desktop/custom-source)的播放地址兜底。本项目不修改飞牛官方 nginx 配置、不 Patch 官方二进制、不改动官方数据库。
 
 > ⚠️ **使用前须知**：本项目基于 MIT 协议开源，仅供个人技术研究与交流使用，请务必阅读文末的 [免责与版权声明](#免责与版权声明disclaimer--copyright-notice)。
 
@@ -114,13 +114,15 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 1. **安装模式选择与透明说明（消除黑盒困惑）**：
    > 📌 **核心运作机制透明说明**：
    > 无论选择哪种模式，**核心代理服务（`fnmusic-ext`）都必须以宿主机 systemd 运行**（`fnmusic-ext.service`，基于项目内独立的 `.venv-proxy` 虚拟环境）。因为代理必须直接接管宿主机的 Unix Domain Socket（`/var/run/trim_music.socket`）才能实现与官方原生后端透明串联。
-   > **两种安装模式的区别仅在于「音乐源服务（musicdl / musicbox）」以何种方式运行与隔离**：
+   > **两种安装模式的区别仅在于音乐源服务以何种方式运行与隔离**：
 
    - **方式 A：Docker 容器模式（推荐）**：
      * **前置条件**：必须先在 fnOS「应用中心」安装好 Docker 引擎。**脚本绝不会擅自安装 Docker 引擎**；
-     * **会部署什么**：通过 `docker-compose` 在本地构建并启动两个轻量音源容器：
+     * **会部署什么**：通过 `docker-compose` 按选择启动音源容器：
        - `fnmusic-musicdl`：端口 `127.0.0.1:8768`（酷我/咪咕聚合搜索与音频解析）；
        - `fnmusic-musicbox`：端口 `0.0.0.0:8770`（网易云高品质解析；局域网可访问二维码扫码）；
+       - `fnmusic-qqmusic`：端口 `127.0.0.1:8771`（QQ 搜索、扫码会话与会员音质）；
+       - `fnmusic-lx-source`：端口 `127.0.0.1:8772`（洛雪脚本隔离运行器）；
      * **容器网络与权限**：容器内无特权（非 root 普通用户运行），数据卷严格隔离在当前项目目录下的 `musicbox-data/` 目录中；
    - **方式 B：Host 宿主机本地服务模式（纯净无 Docker）**：
      * **适合场景**：系统未安装 Docker，或追求极致轻量、超低内存占用的机器；
@@ -150,7 +152,9 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 2. **音源选择（至少选一个，可多选）**：
    - **`1) musicdl`（酷我/咪咕等）**：多平台聚合音源，曲库广泛覆盖绝大多数热门华语流行金曲；
    - **`2) musicbox`（网易云）**：提供高品质无损音质（FLAC）、精准同步 LRC 歌词与高清专辑封面；
-   - **`1,2`（两者兼得，强烈推荐）**：双音源并行聚合！以网易云高品质音源优先，若未命中自动回退至酷我/咪咕检索，打造无死角的全面曲库。
+   - **`3) qqmusic`（QQ 音乐）**：支持 QQ 扫码授权；搜索后优先按账号实际会员权益请求无损音质，再逐级降级；
+   - **`4) lx`（洛雪源）**：可在飞牛音乐的“在线音源”面板中从 `.js` 文件、URL 或文本导入、删除、启停洛雪自定义源；
+   - **`1,2,3,4`（推荐）**：多源并行搜索，原生服务失败时使用已导入的洛雪源解析播放地址。
 3. **大模型每日推荐（可选选填）**：
    - 支持接入任何兼容 OpenAI 接口规范的大模型服务（例如 DeepSeek、通义千问 Qwen、ChatGPT、GLM 等）；
    - 系统将根据您的实际听歌习惯与收藏偏好，每天清晨自动生成包含 20 首好歌的专属「每日推荐」虚拟歌单；
@@ -161,7 +165,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
 > 💡 **进阶：非交互静默安装示例**（适合自动化运维或 Agent 脚本调用）：
 > ```bash
-> ./install.sh --non-interactive --mode docker --sources musicdl,musicbox --extend
+> ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,qqmusic,lx --extend
 > ```
 
 ---
@@ -176,7 +180,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
 **脚本内部全自动化执行流程**：
 - **智能预检与引导**：自动检测配置与依赖。若发现未完成 `./install.sh`，会主动友好引导启动配置；若检测不到飞牛音乐运行套接字，会明确提示去应用中心启动应用；
-- **音源容器/服务自愈**：自动检测 `musicbox` / `musicdl` 服务状态，未就绪时自动拉起并等待健康探测通过；
+- **音源容器/服务自愈**：自动检测所有已启用音源服务，未就绪时自动拉起并等待健康探测通过；
 - **零侵入 Unix Socket 接管**：平滑将官方套接字重命名为 `trim_music_upstream.socket`，并在原位置创建扩展代理监听，赋予正确权限（**不修改飞牛官方 nginx 配置，不 Patch 官方 Go 二进制**）；
 - **全链路严苛验收测试**：
   1. 验证未登录鉴权快速透传（HTTP 401 INVALID TOKEN，响应时延 `< 3s`）；
@@ -204,7 +208,11 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
      http://<飞牛NAS的IP地址>:8770/api/v1/auth/login/qr.png
      ```
    - 打开手机上的【网易云音乐 App】扫码确认登录；登录凭证会自动保存在本地，无需重复扫码。
-4. **每日推荐歌单（若配置了大模型）**：
+4. **QQ 登录与洛雪源管理**：
+   - 在飞牛音乐网页中点击右下角的“在线音源”；也可以直接打开 `/music/api/v1/_ext/settings`；
+   - QQ 音乐仅提供二维码扫码登录，不接收或保存 QQ 密码；会员歌曲是否可播、可用音质由 QQ 音乐按账号权益返回；
+   - 洛雪源脚本可能执行网络请求。运行器被隔离在独立容器和数据卷中，但仍应只导入可信来源。
+5. **每日推荐歌单（若配置了大模型）**：
    - 登录飞牛音乐后，在左侧导航栏「歌单」列表最顶部会自动出现名为「每日推荐」的专属歌单，每天准时换新 20 首推荐曲目。
 
 ---
@@ -341,12 +349,13 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ```
 
 #### ① 搜索聚合与双层缓存（Fast Return & Background Aggregation）
-- **接口拦截**：`/music/api/v1/search/track?keyword=...`
+- **接口拦截**：`/music/api/v1/search/track|artist|album|playlist` 与 `/search/suggest`；顶部全局搜索和歌曲、歌手、专辑、歌单四个结果页都会合并在线内容。
 - **鉴权快速通道**：代理层先透传上游进行鉴权，若用户未登录或 Token 无效（HTTP 401），直接毫秒级返回鉴权失败，绝不浪费算力等待外部音源。
 - **本地与在线双轨并行**：鉴权通过后，并行请求飞牛官方 Go 后端（获取本地曲库）与已启用的在线音源（网易云 musicbox / 多源聚合 musicdl）。
 - **第 1 页极速快返回（2.5 秒窗口）**：针对用户最关心的首屏结果，设置 2.5 秒的快速等待窗口（`FNMUSIC_NETEASE_WAIT_S`）。主音源网易云若在 2.5s 内返回，立即将本地曲目与主音源结果合并响应给前端，告别加载转圈。
 - **后台 Task 异步聚合**：副音源与主音源耗时较长的其余结果，移交后台 `asyncio.Task` 协程继续并发抓取。多音源返回的数据按 `(title, artist)` 统一小写清洗去重（网易云无损音源优先），写入内存 LRU 搜索缓存池（TTL 默认 300 秒）。
 - **翻页瞬时命中**：当用户在客户端滚动浏览翻至第 2 页及以后时，直接从内存缓存池做切片返回，翻页操作丝滑秒开。
+- **在线实体可继续浏览**：在线歌手、专辑和歌单结果使用独立 GUID；点击后可加载详情、歌曲列表以及歌手的专辑列表，而非只能看到不可打开的搜索卡片。
 
 #### ② 歌曲播放与独立后台 Task Tee 边播边落盘（Tee Streaming & Safe Cache）
 - **接口拦截**：`/music/api/v1/track/play-url` 与 `/music/api/v1/track/stream`。
@@ -361,7 +370,8 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 - **元数据标签注入与智能落盘**：
   - 后台写入完毕后，系统严格校验音频字节完整性（排除 `< 1KB` 的错误假流）；
   - 校验通过后，借助 `mutagen` 库自动将在线抓取的歌曲名、艺术家、专辑等 ID3/Vorbis 元数据标签写入音频二进制头，并原子重命名（`os.replace`）正式落盘；
-  - 同步拉取并生成同名 `.lrc` Sidecar 歌词文件同目录存放；
+  - 按 `音乐库/歌手名/歌名.扩展名` 建立目录；同名歌手自动归入同一文件夹，歌曲和同名 `.lrc` Sidecar 歌词并排存放；未知歌手统一归入 `未知歌手/`；
+  - 旧版位于音乐库根目录的在线缓存，在客户端再次读取曲目元数据时自动迁移到对应歌手目录；
   - 若下载不完整，后台任务会立刻主动执行 unlink 清理临时 `.part` 文件，绝不留存任何磁盘脏数据。
 
 #### ③ 收藏夹拦截与多用户本地存储（Multi-User Favorites Merge）
@@ -413,7 +423,9 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 - **可选音源（安装时可多选，至少启用一个）**：
   - **网易云音乐 (`musicbox` :8770)**：[darknessomi/musicbox](https://github.com/darknessomi/musicbox)，无损品质（`lossless`/FLAC）、LRC 歌词、封面，单次搜索默认最多 50 条。部分曲目可能需要扫码登录。
   - **多平台聚合 (`musicdl` :8768)**：[CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl)，酷我、咪咕等。
-  由 `.env` 中 `FNMUSIC_MUSICDL_ENABLED` / `FNMUSIC_NETEASE_ENABLED` 开关；`/_ext/healthz` 在上游健康且**至少一个已启用音源健康**时为 `ok`。
+  - **QQ 音乐 (`qqmusic` :8771)**：搜索、二维码授权、歌词及按账号权益解析的会员音质。
+  - **洛雪自定义源 (`lx-source` :8772)**：兼容洛雪脚本协议，作为已搜索曲目的播放地址兜底，不单独提供搜索元数据。
+  运行时开关由 `.env` 初始值和 `source-config.json` 的设置面板覆盖值共同控制；`/_ext/healthz` 在上游健康且**至少一个可搜索音源健康**时为 `ok`。
 - **毫秒级鉴权与快速路径**：
   - 未登录（401 / Token 无效）请求走本地毫秒级判定，不等待外部音源，耗时 `< 0.1s`。
   - 仅在上游鉴权通过且返回 `code: 0` 时触发在线音源聚合。
@@ -432,7 +444,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
     - 数据块通过内存 `Queue` 分发给播放流，同时由后台 Task 持续落盘至独立临时文件（带有 UUID 的 `.<guid>.<hex>.part`）；
     - 客户端断开连接不影响后台任务完整写入；若最终下载不完整（字节数不符或小于 1KB），自动清理临时 `.part` 文件，绝不留存损坏垃圾。
 - **智能落盘与元数据写入**：
-  - 完整播放/下载完成后，自动将音频落盘至音乐库或缓存目录，并通过 `mutagen` 库自动将在线提取的 `title`、`artist`、`album` ID3/Vorbis 元数据标签写入音频文件，生成同名 `.lrc` 歌词 Sidecar 文件。
+  - 完整播放/下载完成后，自动按 `音乐库/歌手名/歌名.扩展名` 落盘；同名歌手共用目录，歌词以同名 `.lrc` 文件存放在歌曲旁边，并通过 `mutagen` 写入 `title`、`artist`、`album` 标签。
 
 ### 3. 本地与在线歌曲收藏合并（多用户隔离）
 
@@ -493,7 +505,7 @@ fnmusic_ext/
 ├── install.sh                 # 一键安装配置（host / docker + 可选 LLM）
 ├── extend.sh                  # 一键启用扩展（Unix Socket 接管）
 ├── restore.sh                 # 一键还原官方直连
-├── docker-compose.yml         # musicdl / musicbox 音源容器（按需启动）
+├── docker-compose.yml         # 所有音源容器（按需启动）
 ├── .env.example               # 环境变量模板（不含密钥）
 ├── proxy/
 │   ├── app.py                 # FastAPI 代理
@@ -503,13 +515,15 @@ fnmusic_ext/
 │   └── tests/
 ├── musicdl-service/           # CharlesPikachu/musicdl HTTP 包装 (:8768)
 ├── musicbox-service/          # darknessomi/musicbox HTTP 包装 (:8770)
+├── qqmusic-service/           # 固定版本 QQMusicapi 容器 (:8771)
+├── lx-source-service/         # 洛雪自定义源隔离运行器 (:8772)
 ├── docs/
 │   ├── INSTALL.md             # 人工安装
 │   └── AGENT_INSTALL.md       # Agent 安装提示词
 └── README.md
 ```
 
-运行时数据（均 gitignore）：`cache/`、`online_favorites/`、`play_history/`、`recommend_cache/`、`.env`。
+运行时数据（均 gitignore 或 Docker volume）：`cache/`、`online_favorites/`、`play_history/`、`recommend_cache/`、QQ 登录会话、洛雪源脚本、`source-config.json`、`.env`。
 
 ---
 
@@ -525,11 +539,19 @@ fnmusic_ext/
 | `FNMUSIC_NETEASE_ENABLED` | `true` | 是否启用网易云 / musicbox 音源 |
 | `FNMUSIC_NETEASE_WAIT_S` | `2.5` | 第 1 页搜索网易云快速等待超时（秒） |
 | `FNMUSIC_NETEASE_SEARCH_LIMIT` | `100` | 网易云搜索单次最大抓取条数 |
-| `FNMUSIC_MUSICDL_SEARCH_LIMIT` | `30` | musicdl 每个来源单次最大抓取条数 |
+| `FNMUSIC_MUSICDL_SEARCH_LIMIT` | `100` | musicdl 每个来源单次最大抓取条数 |
 | `FNMUSIC_NETEASE_QUALITY` | `lossless` | 网易云音频音质偏好（`lossless` 无损 / `exhigh` / `standard`） |
 | `FNMUSIC_MUSICDL_URL` | `http://127.0.0.1:8768` | musicdl 共享音源服务地址 |
+| `FNMUSIC_QQMUSIC_ENABLED` | `false` | 是否启用 QQ 音乐；安装向导选择 `qqmusic` 时写为 `true` |
+| `FNMUSIC_QQMUSIC_URL` | `http://127.0.0.1:8771` | QQ 音乐服务地址 |
+| `FNMUSIC_QQMUSIC_SEARCH_LIMIT` | `100` | QQ 音乐单次搜索上限 |
+| `FNMUSIC_QQMUSIC_QUALITY` | `F000` | QQ 首选音质；无权益时自动降级 |
+| `FNMUSIC_LX_SOURCE_ENABLED` | `false` | 是否启用洛雪脚本播放兜底 |
+| `FNMUSIC_LX_SOURCE_URL` | `http://127.0.0.1:8772` | 洛雪脚本运行服务地址 |
+| `FNMUSIC_SOURCE_CONFIG` | `$FNMUSIC_HOME/source-config.json` | 设置面板运行时开关文件，权限 `600` |
 | `FNMUSIC_UPSTREAM_SOCK` | `/var/run/trim_music_upstream.socket` | 飞牛音乐原生 Unix Socket 路径 |
 | `FNMUSIC_ONLINE_LIMIT` | `100` | 每页在线合并安全上限；实际按前端请求的 `size` 持续分页 |
+| `FNMUSIC_MERGE_SUGGEST` | `true` | 顶部搜索建议是否合并在线歌曲、歌手、专辑和歌单 |
 | `FNMUSIC_SEARCH_CACHE_TTL` | `300` | 搜索聚合缓存有效期（秒） |
 | `FNMUSIC_CACHE_DIR` | `$FNMUSIC_HOME/cache` | 在线音频 Tee 缓存落盘目录 |
 | `FNMUSIC_FAV_DIR` | `$FNMUSIC_HOME/online_favorites/` | 多用户在线收藏存储目录 |

@@ -7,7 +7,11 @@ from fastapi.testclient import TestClient
 from proxy.app import (
     app,
     CONF,
+    SOURCE_REGISTRY,
+    _ENTITY_SEARCH_CACHE,
+    _ONLINE_ENTITY_CACHE,
     _SEARCH_CACHE,
+    artist_directory_name,
     find_cache_file,
     library_basename,
     remember_media_path,
@@ -33,6 +37,8 @@ def _assert_playback_metadata_shape(data: dict, guid: str) -> None:
 @pytest.fixture(autouse=True)
 def setup_test_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
+    _ENTITY_SEARCH_CACHE.clear()
+    _ONLINE_ENTITY_CACHE.clear()
     cache_dir = str(tmp_path / "cache")
     library_dir = str(tmp_path / "library")
     fav_dir = str(tmp_path / "online_favorites")
@@ -48,6 +54,9 @@ def setup_test_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "lyric_field", "data.lyric")
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "qqmusic_enabled", False)
+    monkeypatch.setitem(CONF, "lx_source_enabled", False)
+    monkeypatch.setattr(SOURCE_REGISTRY, "path", str(tmp_path / "source-config.json"))
     monkeypatch.setitem(CONF, "netease_wait_s", 2.5)
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)
@@ -60,12 +69,25 @@ def setup_test_env(tmp_path, monkeypatch):
         transport=httpx.MockTransport(default_musicbox_handler), base_url="http://127.0.0.1:8770"
     )
 
+    app.state.qqmusic_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404, json={"code": 404})),
+        base_url="http://127.0.0.1:8771",
+    )
+    app.state.lx_source_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404, json={"ok": False})),
+        base_url="http://127.0.0.1:8772",
+    )
+
 
 def test_library_basename_omits_source_id():
-    assert library_basename("晴天", "周杰伦") == "周杰伦 - 晴天"
-    assert library_basename("不再犹豫", "BEYOND") == "BEYOND - 不再犹豫"
+    assert library_basename("晴天", "周杰伦") == "晴天"
+    assert library_basename("不再犹豫", "BEYOND") == "不再犹豫"
     assert library_basename("晴天", "") == "晴天"
     assert "600902" not in library_basename("晴天", "周杰伦")
+    assert artist_directory_name("周杰伦") == "周杰伦"
+    assert artist_directory_name("AC/DC") == "AC_DC"
+    assert artist_directory_name("../") == "_"
+    assert artist_directory_name("") == "未知歌手"
 
 
 def test_find_cache_file_legacy_id_name_and_ref(tmp_path):
@@ -113,6 +135,114 @@ def test_write_audio_tags_id3(tmp_path):
     assert tagged["title"] == ["晴天"]
     assert tagged["artist"] == ["周杰伦"]
     assert tagged["album"] == ["叶惠美"]
+
+
+def test_html_passthrough_injects_settings_entry_once():
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html><body><main>music</main></body></html>", headers={"content-type": "text/html; charset=utf-8"})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    with TestClient(app) as client:
+        response = client.get("/music/")
+        assert response.status_code == 200
+        assert response.text.count("/music/api/v1/_ext/assets/settings.js") == 1
+
+
+def test_ext_source_settings_are_authenticated_and_persist_toggle(tmp_path):
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 0, "data": {"name": "NAS", "lang": "zh-CN"}})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True})),
+        base_url="http://127.0.0.1:8768",
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True})),
+        base_url="http://127.0.0.1:8770",
+    )
+    app.state.qqmusic_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"code": 0, "data": {"loggedIn": False}})),
+        base_url="http://127.0.0.1:8771",
+    )
+    app.state.lx_source_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True, "sources": []})),
+        base_url="http://127.0.0.1:8772",
+    )
+    with TestClient(app) as client:
+        listing = client.get("/music/api/v1/_ext/sources")
+        assert listing.status_code == 200
+        assert {item["id"] for item in listing.json()["builtins"]} == {"musicdl", "netease", "qqmusic", "lx"}
+        rejected = client.patch("/music/api/v1/_ext/sources/qqmusic", json={"enabled": True})
+        assert rejected.status_code == 403
+        updated = client.patch(
+            "/music/api/v1/_ext/sources/qqmusic",
+            json={"enabled": True},
+            headers={"X-FnMusic-Ext": "1"},
+        )
+        assert updated.status_code == 200
+        assert SOURCE_REGISTRY.enabled("qqmusic") is True
+
+
+def test_qq_qrcode_check_never_exposes_credential():
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"code": 0, "data": {"name": "NAS"}})
+        ),
+        base_url="http://unix",
+    )
+
+    def qq_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/login/checkQrcode"
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "event": 0,
+                    "credential": {"musicid": "123", "musickey": "must-not-leak"},
+                },
+            },
+        )
+
+    app.state.qqmusic_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(qq_handler), base_url="http://127.0.0.1:8771"
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/music/api/v1/_ext/qq/qrcode/check",
+            json={"identifier": "qrsig", "type": "qq"},
+            headers={"X-FnMusic-Ext": "1"},
+        )
+        assert response.status_code == 200
+        assert response.json()["data"] == {"event": 0}
+        assert "credential" not in response.text
+        assert "must-not-leak" not in response.text
+
+
+def test_qqmusic_search_is_merged_when_enabled(monkeypatch):
+    monkeypatch.setitem(CONF, "musicdl_enabled", False)
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "qqmusic_enabled", True)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})),
+        base_url="http://unix",
+    )
+
+    def qq_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 0, "data": {"body": {"song": {"list": [{"mid": "mid1", "name": "晴天", "interval": 269, "singer": [{"name": "周杰伦"}], "album": {"name": "叶惠美", "mid": "album1"}}]}}}})
+
+    app.state.qqmusic_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(qq_handler), base_url="http://127.0.0.1:8771"
+    )
+    with TestClient(app) as client:
+        result = client.get("/music/api/v1/search/track?q=晴天&page=1&size=20").json()
+        assert result["data"]["list"][0]["guid"] == "online:qq:mid1"
 
 
 def test_search_track_merge_success():
@@ -236,6 +366,113 @@ def test_search_track_merge_with_q_param():
         items = resp.json()["data"]["list"]
         assert len(items) == 1
         assert items[0]["guid"] == "online:netease:1"
+
+
+def test_search_artist_album_playlist_and_open_details():
+    """全局搜索四类结果；在线实体可进入详情并继续加载歌曲/专辑。"""
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/user/me":
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-1"}})
+        if request.url.path.startswith("/music/api/v1/search/"):
+            return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
+        return httpx.Response(404)
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/search":
+            typ = request.url.params.get("type")
+            data = {
+                "artist": [{"artist_id": 6452, "artists_name": "周杰伦", "alias": "Jay Chou"}],
+                "album": [{"album_id": 18905, "albums_name": "叶惠美", "artists_name": "周杰伦"}],
+                "playlist": [{"playlist_id": 88, "playlist_name": "华语精选", "creator_name": "测试用户"}],
+            }.get(typ, [])
+            return httpx.Response(200, json={"ok": True, "data": data})
+        if path in {"/api/v1/artist/6452", "/api/v1/album/18905", "/api/v1/playlist/88"}:
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "data": [{
+                        "song_id": 186016,
+                        "artist": "周杰伦",
+                        "song_name": "晴天",
+                        "album_name": "叶惠美",
+                        "album_id": 18905,
+                        "duration": 269,
+                        "quality": "SQ",
+                    }],
+                },
+            )
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+
+    with TestClient(app) as client:
+        artist = client.get("/music/api/v1/search/artist?q=周杰伦&page=1&size=24").json()["data"]
+        album = client.get("/music/api/v1/search/album?q=叶惠美&page=1&size=24").json()["data"]
+        playlist = client.get("/music/api/v1/search/playlist?q=华语&page=1&size=24").json()["data"]
+        assert artist["list"][0]["guid"] == "online:netease:artist:6452"
+        assert album["list"][0]["artists"][0]["name"] == "周杰伦"
+        assert playlist["list"][0]["guid"] == "online:netease:playlist:88"
+
+        artist_guid = artist["list"][0]["guid"]
+        detail = client.get("/music/api/v1/artist/detail", params={"guid": artist_guid}).json()["data"]
+        tracks = client.get(
+            "/music/api/v1/track/artist-detail/list",
+            params={"artistGUID": artist_guid, "page": 1, "size": 50},
+        ).json()["data"]
+        albums = client.get(
+            "/music/api/v1/album/artist-detail/list",
+            params={"artistGUID": artist_guid, "page": 1, "size": 24},
+        ).json()["data"]
+        assert detail["name"] == "周杰伦"
+        assert detail["trackCount"] == 1
+        assert tracks["list"][0]["guid"] == "online:netease:186016"
+        assert albums["list"][0]["guid"] == "online:netease:album:18905"
+
+        album_guid = album["list"][0]["guid"]
+        assert client.get("/music/api/v1/album/detail", params={"guid": album_guid}).json()["data"]["name"] == "叶惠美"
+        playlist_guid = playlist["list"][0]["guid"]
+        assert client.get("/music/api/v1/playlist/detail", params={"guid": playlist_guid}).json()["data"]["name"] == "华语精选"
+        playlist_tracks = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": playlist_guid, "page": 1, "size": 50},
+        ).json()["data"]
+        assert playlist_tracks["total"] == 1
+
+
+def test_metadata_migrates_legacy_root_cache_to_artist_folder():
+    guid = "online:kuwo:228908"
+    old_audio = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3")
+    old_lyric = os.path.splitext(old_audio)[0] + ".lrc"
+    with open(old_audio, "wb") as f:
+        f.write(b"x" * 2048)
+    with open(old_lyric, "w", encoding="utf-8") as f:
+        f.write("[00:00.00]晴天")
+    remember_media_path(guid, old_audio)
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"ok": True, "id": "kuwo:228908", "title": "晴天", "artist": "周杰伦", "ext": "mp3"},
+        )
+
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+    with TestClient(app) as client:
+        response = client.get("/music/api/v1/track/metadata", params={"guid": guid})
+        assert response.status_code == 200
+    new_audio = os.path.join(CONF["library_dir"], "周杰伦", "晴天.mp3")
+    assert os.path.exists(new_audio)
+    assert os.path.exists(os.path.splitext(new_audio)[0] + ".lrc")
+    assert not os.path.exists(old_audio)
 
 
 def test_search_track_preserves_lossless_and_common_formats():
@@ -581,15 +818,15 @@ def test_stream_online_guid_range_and_tee_cache():
         assert resp.content == audio_content
         assert resp.headers.get("content-length") == content_len
 
-        # 检查落盘到飞牛曲库目录：歌名 - id.ext + 同名 .lrc
-        cache_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3")
+        # 检查落盘到歌手目录：歌曲与同名歌词并排存放
+        cache_file = os.path.join(CONF["library_dir"], "周杰伦", "晴天.mp3")
         assert os.path.exists(cache_file)
         assert "228908" not in os.path.basename(cache_file)
         with open(cache_file, "rb") as f:
             saved = f.read()
         assert saved == audio_content
 
-        lyric_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.lrc")
+        lyric_file = os.path.join(CONF["library_dir"], "周杰伦", "晴天.lrc")
         assert os.path.exists(lyric_file)
         with open(lyric_file, encoding="utf-8") as f:
             assert "晴天" in f.read()
@@ -947,7 +1184,7 @@ def test_lyric_list_persists_sidecar():
         resp = client.get("/music/api/v1/lyric/list?trackGUID=online:kuwo:228908")
         assert resp.status_code == 200
         assert info_calls["n"] == 1
-        lyric_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.lrc")
+        lyric_file = os.path.join(CONF["library_dir"], "周杰伦", "晴天.lrc")
         assert os.path.exists(lyric_file)
         with open(lyric_file, encoding="utf-8") as f:
             assert "晴天" in f.read()
@@ -1050,6 +1287,57 @@ def test_search_suggest_merge(monkeypatch):
         resp = client.get("/music/api/v1/search/suggest?keyword=周杰伦")
         assert resp.status_code == 200
         assert resp.json()["data"] == ["本地周杰伦", "周杰伦 晴天", "周杰伦 七里香"]
+
+
+def test_search_suggest_merges_all_result_groups(monkeypatch):
+    monkeypatch.setitem(CONF, "merge_suggest", True)
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "track": {"items": [], "total": 0},
+                    "album": {"items": [], "total": 0},
+                    "artist": {"items": [], "total": 0},
+                    "playlist": {"items": [], "total": 0},
+                },
+            },
+        )
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"ok": True, "items": [{"id": "kuwo:1", "source": "kuwo", "title": "晴天", "artist": "周杰伦"}]},
+        )
+
+    def musicbox_handler(request: httpx.Request) -> httpx.Response:
+        typ = request.url.params.get("type")
+        data = {
+            "song": [],
+            "album": [{"album_id": 1, "albums_name": "叶惠美", "artists_name": "周杰伦"}],
+            "artist": [{"artist_id": 2, "artists_name": "周杰伦"}],
+            "playlist": [{"playlist_id": 3, "playlist_name": "华语精选"}],
+        }[typ]
+        return httpx.Response(200, json={"ok": True, "data": data})
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+    app.state.musicbox_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicbox_handler), base_url="http://127.0.0.1:8770"
+    )
+
+    with TestClient(app) as client:
+        data = client.get("/music/api/v1/search/suggest?q=周杰伦").json()["data"]
+    assert data["track"]["items"][0]["guid"] == "online:kuwo:1"
+    assert data["album"]["items"][0]["name"] == "叶惠美"
+    assert data["artist"]["items"][0]["name"] == "周杰伦"
+    assert data["playlist"]["items"][0]["name"] == "华语精选"
 
 
 def test_online_hls_playlist():
@@ -1780,6 +2068,3 @@ def test_favorite_track_list_official_items_populate_is_favorite_and_empty_handl
         assert items[1]["isFavorite"] is True
         assert items[2]["guid"] == "online:netease:12345"
         assert items[2]["isFavorite"] is True
-
-
-

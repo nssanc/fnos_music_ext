@@ -19,33 +19,45 @@ import shutil
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Coroutine
 from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
+    from .online_sources import extract_qq_tracks, lx_music_info, lx_source_key, qq_play_url
+    from .source_registry import SourceRegistry
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
+    from online_sources import extract_qq_tracks, lx_music_info, lx_source_key, qq_play_url  # type: ignore
+    from source_registry import SourceRegistry  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 _HOME = dailyrec.home_dir()
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
+    "qqmusic_url": os.environ.get("FNMUSIC_QQMUSIC_URL", "http://127.0.0.1:8771"),
+    "lx_source_url": os.environ.get("FNMUSIC_LX_SOURCE_URL", "http://127.0.0.1:8772"),
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "true").lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "qqmusic_enabled": os.environ.get("FNMUSIC_QQMUSIC_ENABLED", "false").lower() in ("true", "1", "yes"),
+    "lx_source_enabled": os.environ.get("FNMUSIC_LX_SOURCE_ENABLED", "false").lower() in ("true", "1", "yes"),
     "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "2.5")),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "100")),
-    "musicdl_search_limit": int(os.environ.get("FNMUSIC_MUSICDL_SEARCH_LIMIT", "30")),
+    "musicdl_search_limit": int(os.environ.get("FNMUSIC_MUSICDL_SEARCH_LIMIT", "100")),
+    "qqmusic_search_limit": int(os.environ.get("FNMUSIC_QQMUSIC_SEARCH_LIMIT", "100")),
+    "qqmusic_quality": os.environ.get("FNMUSIC_QQMUSIC_QUALITY", "F000"),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
     "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "100")),
     "search_list_path": os.environ.get("FNMUSIC_SEARCH_LIST_PATH", "data.list"),
@@ -55,7 +67,7 @@ CONF = {
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
-    "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "false").lower() in ("true", "1", "yes"),
+    "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "true").lower() in ("true", "1", "yes"),
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
@@ -67,6 +79,29 @@ CONF = {
     "llm_base_url": (os.environ.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/"),
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
 }
+
+SOURCE_REGISTRY = SourceRegistry(
+    os.environ.get("FNMUSIC_SOURCE_CONFIG", os.path.join(_HOME, "source-config.json")),
+    {
+        "musicdl": CONF["musicdl_enabled"],
+        "netease": CONF["netease_enabled"],
+        "qqmusic": CONF["qqmusic_enabled"],
+        "lx": CONF["lx_source_enabled"],
+    },
+)
+
+
+def source_enabled(source_id: str) -> bool:
+    override = SOURCE_REGISTRY.override(source_id)
+    if override is not None:
+        return override
+    conf_key = {
+        "musicdl": "musicdl_enabled",
+        "netease": "netease_enabled",
+        "qqmusic": "qqmusic_enabled",
+        "lx": "lx_source_enabled",
+    }.get(source_id)
+    return bool(CONF.get(conf_key, False)) if conf_key else False
 
 _REDACT_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
 
@@ -117,6 +152,8 @@ _FORMAT_ALIASES = {
 
 # 模块级搜索缓存
 _SEARCH_CACHE: dict[str, dict] = {}
+_ENTITY_SEARCH_CACHE: dict[tuple[str, str], dict] = {}
+_ONLINE_ENTITY_CACHE: dict[str, dict] = {}
 
 
 def _clean_search_cache() -> None:
@@ -126,11 +163,30 @@ def _clean_search_cache() -> None:
         to_remove = sorted_keys[: len(sorted_keys) // 2]
         for k in to_remove:
             _SEARCH_CACHE.pop(k, None)
+    if len(_ENTITY_SEARCH_CACHE) > 200:
+        sorted_keys = sorted(
+            _ENTITY_SEARCH_CACHE.keys(), key=lambda k: _ENTITY_SEARCH_CACHE[k].get("ts", 0)
+        )
+        for key in sorted_keys[: len(sorted_keys) // 2]:
+            _ENTITY_SEARCH_CACHE.pop(key, None)
 
 
 def _set_search_cache(keyword: str, entry: dict) -> None:
     _clean_search_cache()
     _SEARCH_CACHE[keyword] = entry
+
+
+def _set_online_entity_cache(guid: str, entry: dict) -> None:
+    if len(_ONLINE_ENTITY_CACHE) >= 1000 and guid not in _ONLINE_ENTITY_CACHE:
+        oldest = sorted(
+            _ONLINE_ENTITY_CACHE,
+            key=lambda key: _ONLINE_ENTITY_CACHE[key].get("detail_ts")
+            or _ONLINE_ENTITY_CACHE[key].get("ts")
+            or 0,
+        )
+        for key in oldest[:500]:
+            _ONLINE_ENTITY_CACHE.pop(key, None)
+    _ONLINE_ENTITY_CACHE[guid] = entry
 
 
 def deduplicate_online_items(items: list[dict]) -> list[dict]:
@@ -226,6 +282,7 @@ def source_from_online_guid(guid: str) -> str:
 def build_online_track(item: dict) -> dict:
     """对齐飞牛前端 ZQ 解构 / _h() 期望：artists、album 对象、genres 数组、audioSpec、duration 毫秒。"""
     guid = online_guid_from_item(item)
+    _set_online_entity_cache(guid, {**item, "ts": time.time()})
     src = str(item.get("source") or source_from_online_guid(guid) or "")
     title = str(item.get("title") or item.get("name") or "")
     artist = str(item.get("artist") or "")
@@ -302,6 +359,90 @@ def build_online_track(item: dict) -> dict:
     }
 
 
+def online_entity_guid(kind: str, raw_id: Any) -> str:
+    return f"online:netease:{kind}:{raw_id}"
+
+
+def parse_online_entity_guid(guid: str, kind: str | None = None) -> tuple[str, str] | None:
+    parts = (guid or "").split(":")
+    if len(parts) < 4 or parts[:2] != ["online", "netease"]:
+        return None
+    entity_kind = parts[2]
+    if parts[3] == "name" and len(parts) >= 5:
+        entity_kind = f"{entity_kind}-name"
+        raw_id = ":".join(parts[4:])
+    else:
+        raw_id = ":".join(parts[3:])
+    if kind and entity_kind != kind:
+        return None
+    return entity_kind, raw_id
+
+
+def build_online_artist(item: dict) -> dict | None:
+    raw_id = item.get("artist_id") or item.get("id")
+    name = str(item.get("artists_name") or item.get("artist_name") or item.get("name") or "").strip()
+    if not raw_id or not name:
+        return None
+    guid = online_entity_guid("artist", raw_id)
+    result = {
+        "guid": guid,
+        "id": guid,
+        "name": name,
+        "coverId": "",
+        "albumCount": int(item.get("album_count") or 0),
+        "trackCount": int(item.get("track_count") or 0),
+        "alias": str(item.get("alias") or ""),
+        "isOnline": True,
+    }
+    _set_online_entity_cache(guid, {**result, "raw": dict(item), "ts": time.time()})
+    return result
+
+
+def build_online_album(item: dict) -> dict | None:
+    raw_id = item.get("album_id") or item.get("id")
+    name = str(item.get("albums_name") or item.get("album_name") or item.get("name") or "").strip()
+    if not raw_id or not name:
+        return None
+    artist_name = str(item.get("artists_name") or item.get("artist_name") or item.get("artist") or "").strip()
+    guid = online_entity_guid("album", raw_id)
+    artists = []
+    if artist_name:
+        artists = [{"guid": online_entity_guid("artist:name", artist_name), "name": artist_name}]
+    result = {
+        "guid": guid,
+        "id": guid,
+        "name": name,
+        "artists": artists,
+        "coverId": "",
+        "trackCount": int(item.get("track_count") or 0),
+        "releaseYear": item.get("release_year"),
+        "isOnline": True,
+    }
+    _set_online_entity_cache(guid, {**result, "raw": dict(item), "ts": time.time()})
+    return result
+
+
+def build_online_playlist(item: dict) -> dict | None:
+    raw_id = item.get("playlist_id") or item.get("id")
+    name = str(item.get("playlist_name") or item.get("name") or "").strip()
+    if not raw_id or not name:
+        return None
+    guid = online_entity_guid("playlist", raw_id)
+    result = {
+        "guid": guid,
+        "id": guid,
+        "name": name,
+        "coverId": "",
+        "trackCount": int(item.get("track_count") or 0),
+        "createdAt": int(item.get("created_at") or 0),
+        "updatedAt": int(item.get("updated_at") or 0),
+        "creatorName": str(item.get("creator_name") or ""),
+        "isOnline": True,
+    }
+    _set_online_entity_cache(guid, {**result, "raw": dict(item), "ts": time.time()})
+    return result
+
+
 def artist_from_track(item: dict) -> str:
     if not isinstance(item, dict):
         return ""
@@ -349,16 +490,34 @@ def online_file_id(guid: str) -> str:
 def safe_basename_title(title: str) -> str:
     t = re.sub(r'[/\\:\0]', "_", (title or "").strip()) or "unknown"
     t = re.sub(r"\s+", " ", t).strip(" .")
-    return t[:120]
+    return (t or "unknown")[:120]
 
 
 def library_basename(title: str, artist: str = "") -> str:
-    """曲库文件名：歌手 - 歌名（无源站 id）。飞牛无标签时会用文件名当标题。"""
-    title_s = safe_basename_title(title)
-    artist_s = safe_basename_title(artist) if (artist or "").strip() else ""
-    if artist_s and artist_s.lower() != title_s.lower() and artist_s != "unknown":
-        return f"{artist_s} - {title_s}"
-    return title_s
+    """歌手目录内的曲库文件名：仅使用歌名，不包含源站 id。"""
+    return safe_basename_title(title)
+
+
+def artist_directory_name(artist: str) -> str:
+    """把同名歌手稳定映射到同一安全目录；缺失歌手时集中到“未知歌手”。"""
+    raw = (artist or "").strip()
+    if not raw:
+        return "未知歌手"
+    safe = safe_basename_title(raw)
+    return "未知歌手" if safe == "unknown" else safe
+
+
+def library_artist_dir(artist: str) -> str:
+    root = detect_library_dir()
+    directory = os.path.join(root, artist_directory_name(artist))
+    os.makedirs(directory, exist_ok=True)
+    try:
+        parent_stat = os.stat(root)
+        os.chown(directory, parent_stat.st_uid, parent_stat.st_gid)
+        os.chmod(directory, 0o755)
+    except Exception:
+        pass
+    return directory
 
 
 def media_ref_path(guid: str) -> str:
@@ -552,7 +711,43 @@ def library_media_path(guid: str, title: str, ext: str, artist: str = "") -> str
             if os.path.getsize(path) > 0:
                 return path
     os.makedirs(lib, exist_ok=True)
-    return unique_library_path(lib, library_basename(title, artist), ext)
+    artist_dir = library_artist_dir(artist)
+    return unique_library_path(artist_dir, library_basename(title, artist), ext)
+
+
+def organize_cached_media(guid: str, audio_path: str, title: str, artist: str) -> str:
+    """把旧版落在曲库根目录的在线音频及同名歌词迁入歌手目录。"""
+    if not audio_path or not (title or "").strip() or not (artist or "").strip():
+        return audio_path
+    target_dir = library_artist_dir(artist)
+    try:
+        if os.path.abspath(os.path.dirname(audio_path)) == os.path.abspath(target_dir):
+            remember_media_path(guid, audio_path)
+            return audio_path
+    except Exception:
+        return audio_path
+
+    ext = os.path.splitext(audio_path)[1].lstrip(".") or "mp3"
+    dest = unique_library_path(target_dir, library_basename(title, artist), ext)
+    old_lyric = os.path.splitext(audio_path)[0] + ".lrc"
+    new_lyric = os.path.splitext(dest)[0] + ".lrc"
+    try:
+        try:
+            os.replace(audio_path, dest)
+        except OSError:
+            shutil.move(audio_path, dest)
+        adopt_library_perms(dest)
+        if os.path.exists(old_lyric) and not os.path.exists(new_lyric):
+            try:
+                os.replace(old_lyric, new_lyric)
+            except OSError:
+                shutil.move(old_lyric, new_lyric)
+            adopt_library_perms(new_lyric)
+        remember_media_path(guid, dest)
+        return dest
+    except Exception as e:
+        logger.warning("Failed to organize cached media for %s: %s", guid, e)
+        return audio_path
 
 
 def find_lyric_file(guid: str) -> str | None:
@@ -588,10 +783,11 @@ def lyric_cache_path(guid: str, title: str = "", artist: str = "") -> str:
     audio = find_cache_file(guid)
     if audio:
         return os.path.splitext(audio)[0] + ".lrc"
+    if (title or "").strip() or (artist or "").strip():
+        d = library_artist_dir(artist)
+        return os.path.join(d, f"{library_basename(title, artist)}.lrc")
     d = detect_library_dir()
     os.makedirs(d, exist_ok=True)
-    if (title or "").strip() or (artist or "").strip():
-        return os.path.join(d, f"{library_basename(title, artist)}.lrc")
     return os.path.join(d, f"{cache_safe_guid(guid)}.lrc")
 
 
@@ -611,8 +807,28 @@ def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -
     text = (text or "").strip()
     if not text:
         return
-    if text == read_lyric_cache(guid):
-        return
+    existing = find_lyric_file(guid)
+    if existing and (title or "").strip() and (artist or "").strip():
+        target_dir = library_artist_dir(artist)
+        if os.path.abspath(os.path.dirname(existing)) != os.path.abspath(target_dir):
+            dest = unique_library_path(target_dir, library_basename(title, artist), "lrc")
+            try:
+                try:
+                    os.replace(existing, dest)
+                except OSError:
+                    shutil.move(existing, dest)
+                adopt_library_perms(dest)
+                remember_media_path(guid, dest)
+                existing = dest
+            except Exception as e:
+                logger.warning("Failed to organize lyric cache for %s: %s", guid, e)
+    if existing:
+        try:
+            with open(existing, encoding="utf-8") as f:
+                if text == f.read().strip():
+                    return
+        except Exception:
+            pass
     path = lyric_cache_path(guid, title=title, artist=artist)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     part_path = f"{path}.{uuid4().hex[:8]}.part"
@@ -826,6 +1042,22 @@ def get_musicbox_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+def get_qqmusic_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    client = getattr(fastapi_app.state, "qqmusic_client", None)
+    if client is None:
+        client = httpx.AsyncClient(base_url=CONF["qqmusic_url"], timeout=25.0)
+        fastapi_app.state.qqmusic_client = client
+    return client
+
+
+def get_lx_source_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    client = getattr(fastapi_app.state, "lx_source_client", None)
+    if client is None:
+        client = httpx.AsyncClient(base_url=CONF["lx_source_url"], timeout=25.0)
+        fastapi_app.state.lx_source_client = client
+    return client
+
+
 def get_llm_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     client = getattr(fastapi_app.state, "llm_client", None)
     if client is None:
@@ -850,6 +1082,23 @@ async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Re
     )
     resp = await client.send(req, stream=True)
     resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+
+    content_type = resp.headers.get("content-type", "").lower()
+    if request.method == "GET" and "text/html" in content_type:
+        content = await resp.aread()
+        await resp.aclose()
+        marker = b"/music/api/v1/_ext/assets/settings.js"
+        if marker not in content:
+            tag = b'<link rel="stylesheet" href="/music/api/v1/_ext/assets/settings.css"><script defer src="/music/api/v1/_ext/assets/settings.js"></script>'
+            lower = content.lower()
+            position = lower.rfind(b"</body>")
+            content = content[:position] + tag + content[position:] if position >= 0 else content + tag
+        return Response(
+            content=content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
 
     async def body_stream() -> AsyncGenerator[bytes, None]:
         try:
@@ -925,6 +1174,93 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
     except Exception as e:
         logger.warning("Failed to fetch online search from musicdl: %s", e)
     return None
+
+
+async def fetch_qqmusic_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
+    if not keyword:
+        return None
+    try:
+        response = await client.post(
+            "/search/byType",
+            json={"keyword": keyword, "type": 0, "num": min(max(limit, 1), 100), "page": 1},
+            timeout=25.0,
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("code") in (None, 0):
+                tracks = extract_qq_tracks(payload)
+                if tracks:
+                    return tracks
+        response = await client.post(
+            "/search/general",
+            json={"keyword": keyword, "num": min(max(limit, 1), 100), "page": 1},
+            timeout=25.0,
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("code") in (None, 0):
+                tracks = extract_qq_tracks(payload)
+                if tracks:
+                    return tracks
+        response = await client.get("/search/quick", params={"keyword": keyword}, timeout=15.0)
+        if response.status_code == 200:
+            return extract_qq_tracks(response.json())
+        return None
+    except Exception as exc:
+        logger.warning("Failed to fetch QQ Music search: %s", exc)
+        return None
+
+
+async def resolve_lx_action(
+    request: Request,
+    guid: str,
+    item: dict,
+    action: str = "musicUrl",
+    quality: str = "flac",
+) -> Any:
+    if not source_enabled("lx"):
+        return None
+    source = lx_source_key(str(item.get("source") or source_from_online_guid(guid)))
+    try:
+        response = await get_lx_source_client(request.app).post(
+            "/api/v1/resolve",
+            json={
+                "source": source,
+                "action": action,
+                "quality": quality,
+                "musicInfo": lx_music_info(item, guid),
+            },
+            timeout=25.0,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        return payload.get("value") if isinstance(payload, dict) and payload.get("ok") else None
+    except Exception as exc:
+        logger.warning("LX source %s failed for %s: %s", action, guid, exc)
+        return None
+
+
+async def resolve_qq_url(client: httpx.AsyncClient, song_mid: str) -> tuple[str, str, int]:
+    preferred = str(CONF.get("qqmusic_quality") or "F000").upper()
+    quality_order = []
+    for quality in (preferred, "F000", "O800", "M800", "M500"):
+        if quality not in quality_order:
+            quality_order.append(quality)
+    for quality in quality_order:
+        try:
+            response = await client.get(
+                "/song/urls", params={"mids": song_mid, "type": quality}, timeout=15.0
+            )
+            if response.status_code != 200:
+                continue
+            url, size = qq_play_url(response.json(), song_mid)
+            if url:
+                ext = "flac" if quality.startswith(("F", "Q", "AI")) else "ogg" if quality.startswith("O") else "mp3"
+                return url, ext, size
+        except Exception as exc:
+            logger.debug("QQ Music URL quality %s failed for %s: %s", quality, song_mid, exc)
+    return "", "mp3", 0
 
 
 async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
@@ -1009,6 +1345,167 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
     except Exception as e:
         logger.warning("Failed to fetch musicbox search: %s", e)
         return None
+
+
+async def fetch_musicbox_entity_search(
+    client: httpx.AsyncClient, keyword: str, entity_type: str, limit: int
+) -> list[dict] | None:
+    if not keyword or entity_type not in {"artist", "album", "playlist"}:
+        return None
+    try:
+        r = await client.get(
+            "/api/v1/search",
+            params={"keyword": keyword, "limit": min(max(limit, 1), 100), "type": entity_type},
+            timeout=20.0,
+        )
+        if r.status_code != 200:
+            return None
+        payload = r.json()
+        if not isinstance(payload, dict) or payload.get("ok") is False:
+            return None
+        raw = payload.get("data")
+        return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else None
+    except Exception as e:
+        logger.warning("Failed to fetch musicbox %s search: %s", entity_type, e)
+        return None
+
+
+def normalize_netease_track(item: dict) -> dict | None:
+    song_id = item.get("song_id") or item.get("id")
+    if not song_id:
+        return None
+    quality = str(item.get("quality") or item.get("level") or "").upper()
+    raw_type = str(item.get("type") or "").lower()
+    ext = "flac" if any(q in quality for q in ("SQ", "HR", "无损")) else (raw_type or "mp3")
+    try:
+        duration_s = float(item.get("duration") or item.get("duration_s") or 0)
+    except (TypeError, ValueError):
+        duration_s = 0.0
+    return {
+        "id": f"netease:{song_id}",
+        "source": "netease",
+        "title": str(item.get("song_name") or item.get("name") or item.get("title") or ""),
+        "artist": str(item.get("artist") or item.get("artists_name") or ""),
+        "album": str(item.get("album_name") or item.get("album") or ""),
+        "album_id": item.get("album_id"),
+        "duration_s": duration_s,
+        "ext": play_format_from_ext(ext),
+        "cover_url": str(item.get("cover_url") or item.get("album_pic_url") or ""),
+        "lyric": "",
+    }
+
+
+async def load_online_entity_bundle(request: Request, guid: str) -> dict | None:
+    parsed = parse_online_entity_guid(guid)
+    if not parsed:
+        return None
+    entity_kind, raw_id = parsed
+    cached = _ONLINE_ENTITY_CACHE.get(guid)
+    if cached and cached.get("tracks") is not None:
+        if time.time() - float(cached.get("detail_ts") or 0) < CONF["search_cache_ttl"]:
+            return cached
+
+    client = get_musicbox_client(request.app)
+    resolved_guid = guid
+    resolved_name = ""
+    if entity_kind == "artist-name":
+        matches = await fetch_musicbox_entity_search(client, raw_id, "artist", 20) or []
+        exact = next(
+            (
+                item
+                for item in matches
+                if str(item.get("artists_name") or item.get("name") or "").casefold()
+                == raw_id.casefold()
+            ),
+            matches[0] if matches else None,
+        )
+        if not exact:
+            return None
+        resolved_name = str(exact.get("artists_name") or exact.get("name") or raw_id)
+        raw_id = str(exact.get("artist_id") or exact.get("id") or "")
+        entity_kind = "artist"
+        resolved_guid = online_entity_guid("artist", raw_id)
+
+    endpoint = {
+        "artist": f"/api/v1/artist/{raw_id}",
+        "album": f"/api/v1/album/{raw_id}",
+        "playlist": f"/api/v1/playlist/{raw_id}",
+    }.get(entity_kind)
+    if not endpoint:
+        return None
+    params = {"limit": 100} if entity_kind == "artist" else None
+    try:
+        response = await client.get(endpoint, params=params, timeout=40.0)
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("ok") is False:
+            return None
+        raw_tracks = payload.get("data")
+        if not isinstance(raw_tracks, list):
+            return None
+    except Exception as e:
+        logger.warning("Failed to load online %s %s: %s", entity_kind, raw_id, e)
+        return None
+
+    normalized = [normalize_netease_track(item) for item in raw_tracks if isinstance(item, dict)]
+    tracks = [build_online_track(item) for item in normalized if item]
+    prior = dict(_ONLINE_ENTITY_CACHE.get(guid) or _ONLINE_ENTITY_CACHE.get(resolved_guid) or {})
+    name = str(prior.get("name") or "")
+    if not name and normalized:
+        if entity_kind == "album":
+            name = str(normalized[0].get("album") or "")
+        elif entity_kind == "artist":
+            name = resolved_name or raw_id
+    cover_id = str(tracks[0].get("guid") or "") if tracks else ""
+    bundle = {
+        **prior,
+        "guid": guid,
+        "id": guid,
+        "name": name or str(prior.get("name") or "在线内容"),
+        "coverId": cover_id,
+        "trackCount": len(tracks),
+        "tracks": tracks,
+        "detail_ts": time.time(),
+        "entityKind": entity_kind,
+        "rawId": raw_id,
+    }
+    if entity_kind == "artist":
+        albums: dict[str, dict] = {}
+        for item in normalized:
+            album_id = item.get("album_id")
+            album_name = str(item.get("album") or "").strip()
+            if not album_id or not album_name:
+                continue
+            album_guid = online_entity_guid("album", album_id)
+            albums.setdefault(
+                album_guid,
+                {
+                    "guid": album_guid,
+                    "id": album_guid,
+                    "name": album_name,
+                    "artists": [{"guid": guid, "name": bundle["name"]}],
+                    "coverId": "",
+                    "trackCount": 0,
+                    "isOnline": True,
+                },
+            )
+            albums[album_guid]["trackCount"] += 1
+        bundle["albums"] = list(albums.values())
+        bundle["albumCount"] = len(albums)
+    elif entity_kind == "album":
+        artist_name = str(normalized[0].get("artist") or "") if normalized else ""
+        bundle["artists"] = prior.get("artists") or (
+            [{"guid": online_entity_guid("artist:name", artist_name), "name": artist_name}]
+            if artist_name
+            else []
+        )
+    _set_online_entity_cache(guid, bundle)
+    if resolved_guid != guid:
+        _set_online_entity_cache(
+            resolved_guid, {**bundle, "guid": resolved_guid, "id": resolved_guid}
+        )
+    return bundle
 
 
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | None:
@@ -1258,6 +1755,8 @@ async def lifespan(fastapi_app: FastAPI):
     created_upstream = False
     created_musicdl = False
     created_musicbox = False
+    created_qqmusic = False
+    created_lx_source = False
     created_llm = False
 
     if getattr(fastapi_app.state, "upstream_client", None) is None:
@@ -1282,6 +1781,18 @@ async def lifespan(fastapi_app: FastAPI):
         )
         created_musicbox = True
 
+    if getattr(fastapi_app.state, "qqmusic_client", None) is None:
+        fastapi_app.state.qqmusic_client = httpx.AsyncClient(
+            base_url=CONF["qqmusic_url"], timeout=25.0
+        )
+        created_qqmusic = True
+
+    if getattr(fastapi_app.state, "lx_source_client", None) is None:
+        fastapi_app.state.lx_source_client = httpx.AsyncClient(
+            base_url=CONF["lx_source_url"], timeout=25.0
+        )
+        created_lx_source = True
+
     if getattr(fastapi_app.state, "llm_client", None) is None:
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
@@ -1298,6 +1809,12 @@ async def lifespan(fastapi_app: FastAPI):
         if created_musicbox and getattr(fastapi_app.state, "musicbox_client", None):
             await fastapi_app.state.musicbox_client.aclose()
             fastapi_app.state.musicbox_client = None
+        if created_qqmusic and getattr(fastapi_app.state, "qqmusic_client", None):
+            await fastapi_app.state.qqmusic_client.aclose()
+            fastapi_app.state.qqmusic_client = None
+        if created_lx_source and getattr(fastapi_app.state, "lx_source_client", None):
+            await fastapi_app.state.lx_source_client.aclose()
+            fastapi_app.state.lx_source_client = None
         if created_llm and getattr(fastapi_app.state, "llm_client", None):
             await fastapi_app.state.llm_client.aclose()
             fastapi_app.state.llm_client = None
@@ -1306,15 +1823,233 @@ async def lifespan(fastapi_app: FastAPI):
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
 
 
+async def require_ext_access(request: Request, mutation: bool = False) -> None:
+    """Require a valid fnOS Music session; mutations also require our same-origin header."""
+    if mutation:
+        if request.headers.get("x-fnmusic-ext") != "1":
+            raise HTTPException(status_code=403, detail="missing extension request header")
+        origin = request.headers.get("origin")
+        host = request.headers.get("host")
+        if origin and host:
+            try:
+                if httpx.URL(origin).host != httpx.URL(f"http://{host}").host:
+                    raise HTTPException(status_code=403, detail="cross-origin request rejected")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=403, detail="invalid origin") from exc
+    try:
+        response = await get_upstream_client(request.app).get(
+            "/music/api/v1/settings/server",
+            headers=copy_incoming_headers(request),
+            timeout=5.0,
+        )
+        payload = response.json() if response.status_code == 200 else None
+        if response.status_code != 200 or not isinstance(payload, dict) or payload.get("code") != 0:
+            raise HTTPException(status_code=401, detail="fnOS Music login required")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="unable to verify fnOS Music session") from exc
+
+
+async def _service_status(client: httpx.AsyncClient, path: str) -> str:
+    try:
+        response = await client.get(path, timeout=2.5)
+        return "ok" if response.status_code == 200 else f"HTTP {response.status_code}"
+    except Exception:
+        return "unavailable"
+
+
+async def _service_json(
+    client: httpx.AsyncClient,
+    method: str,
+    path: str,
+    body: dict | None = None,
+) -> tuple[int, dict]:
+    try:
+        response = await client.request(method, path, json=body, timeout=30.0)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            payload = {"ok": False, "error": "invalid service response"}
+        return response.status_code, payload
+    except Exception as exc:
+        return 503, {"ok": False, "error": str(exc)}
+
+
+@app.get("/music/api/v1/_ext/assets/settings.js")
+async def ext_settings_asset():
+    return Response(
+        content=(_STATIC_DIR / "ext-settings.js").read_bytes(),
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/music/api/v1/_ext/assets/settings.css")
+async def ext_settings_style():
+    return Response(
+        content=(_STATIC_DIR / "ext-settings.css").read_bytes(),
+        media_type="text/css",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/music/api/v1/_ext/settings")
+async def ext_settings_page():
+    return HTMLResponse(
+        content=(_STATIC_DIR / "ext-settings.html").read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/music/api/v1/_ext/sources")
+async def ext_sources(request: Request):
+    await require_ext_access(request)
+    clients = {
+        "musicdl": (get_musicdl_client(request.app), "/healthz"),
+        "netease": (get_musicbox_client(request.app), "/healthz"),
+        "qqmusic": (get_qqmusic_client(request.app), "/health"),
+        "lx": (get_lx_source_client(request.app), "/healthz"),
+    }
+    statuses = await asyncio.gather(*(_service_status(*clients[key]) for key in clients))
+    status_map = dict(zip(clients, statuses))
+    descriptions = {
+        "musicdl": "酷我、咪咕等公开曲库聚合搜索",
+        "netease": "网易云搜索、歌词与高品质播放",
+        "qqmusic": "QQ 搜索及登录账号的会员音质",
+        "lx": "用已导入的洛雪脚本补充播放地址",
+    }
+    builtins = [
+        {
+            "id": source_id,
+            "enabled": source_enabled(source_id),
+            "status": status_map[source_id],
+            "description": descriptions[source_id],
+        }
+        for source_id in clients
+    ]
+
+    _, lx_payload = await _service_json(get_lx_source_client(request.app), "GET", "/api/v1/sources")
+    _, qq_payload = await _service_json(get_qqmusic_client(request.app), "GET", "/login/status")
+    qq_data = qq_payload.get("data") if isinstance(qq_payload.get("data"), dict) else {}
+    qq_summary: dict[str, Any] = {
+        "loggedIn": bool(qq_data.get("loggedIn")),
+        "expired": bool(qq_data.get("expired")),
+        "musicid": qq_data.get("musicid"),
+        "nickname": "",
+    }
+    if qq_summary["loggedIn"]:
+        _, user_payload = await _service_json(get_qqmusic_client(request.app), "GET", "/user/self")
+        user_data = user_payload.get("data") if isinstance(user_payload.get("data"), dict) else {}
+        qq_summary["nickname"] = str(
+            user_data.get("nick") or user_data.get("nickname") or user_data.get("name") or ""
+        )
+    return {
+        "ok": True,
+        "builtins": builtins,
+        "lxSources": lx_payload.get("sources") if isinstance(lx_payload.get("sources"), list) else [],
+        "qq": qq_summary,
+    }
+
+
+@app.patch("/music/api/v1/_ext/sources/{source_id}")
+async def ext_source_toggle(request: Request, source_id: str):
+    await require_ext_access(request, mutation=True)
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        raise HTTPException(status_code=400, detail="enabled must be boolean")
+    searchable = ("musicdl", "netease", "qqmusic")
+    if source_id in searchable and body["enabled"] is False:
+        enabled_searchable = [item for item in searchable if source_enabled(item)]
+        if enabled_searchable == [source_id]:
+            raise HTTPException(status_code=400, detail="at least one searchable source must stay enabled")
+    try:
+        SOURCE_REGISTRY.set_enabled(source_id, body["enabled"])
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="unknown built-in source") from exc
+    _SEARCH_CACHE.clear()
+    return {"ok": True, "id": source_id, "enabled": body["enabled"]}
+
+
+@app.post("/music/api/v1/_ext/lx-sources")
+async def ext_lx_source_create(request: Request):
+    await require_ext_access(request, mutation=True)
+    body = await request.json()
+    status, payload = await _service_json(
+        get_lx_source_client(request.app), "POST", "/api/v1/sources", body
+    )
+    return JSONResponse(content=payload, status_code=status)
+
+
+@app.patch("/music/api/v1/_ext/lx-sources/{source_id}")
+async def ext_lx_source_update(request: Request, source_id: str):
+    await require_ext_access(request, mutation=True)
+    body = await request.json()
+    status, payload = await _service_json(
+        get_lx_source_client(request.app),
+        "PATCH",
+        f"/api/v1/sources/{quote(source_id, safe='')}",
+        body,
+    )
+    return JSONResponse(content=payload, status_code=status)
+
+
+@app.delete("/music/api/v1/_ext/lx-sources/{source_id}")
+async def ext_lx_source_delete(request: Request, source_id: str):
+    await require_ext_access(request, mutation=True)
+    status, payload = await _service_json(
+        get_lx_source_client(request.app),
+        "DELETE",
+        f"/api/v1/sources/{quote(source_id, safe='')}",
+    )
+    return JSONResponse(content=payload, status_code=status)
+
+
+@app.post("/music/api/v1/_ext/qq/qrcode")
+async def ext_qq_qrcode(request: Request):
+    await require_ext_access(request, mutation=True)
+    status, payload = await _service_json(
+        get_qqmusic_client(request.app), "POST", "/login/qrcode", {"type": "qq"}
+    )
+    return JSONResponse(content={"ok": status == 200, "data": payload.get("data"), "error": payload.get("message")}, status_code=status)
+
+
+@app.post("/music/api/v1/_ext/qq/qrcode/check")
+async def ext_qq_qrcode_check(request: Request):
+    await require_ext_access(request, mutation=True)
+    body = await request.json()
+    safe_body = {"identifier": str(body.get("identifier") or ""), "type": "qq"}
+    status, payload = await _service_json(
+        get_qqmusic_client(request.app), "POST", "/login/checkQrcode", safe_body
+    )
+    raw_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    # QQMusicapi returns the newly issued credential on success.  It belongs only
+    # in the dedicated service data store and must never cross the proxy boundary.
+    public_data = {"event": raw_data.get("event")}
+    return JSONResponse(content={"ok": status == 200, "data": public_data, "error": payload.get("message")}, status_code=status)
+
+
+@app.post("/music/api/v1/_ext/qq/logout")
+async def ext_qq_logout(request: Request):
+    await require_ext_access(request, mutation=True)
+    status, payload = await _service_json(get_qqmusic_client(request.app), "POST", "/login/logout", {})
+    return JSONResponse(content={"ok": status == 200, "data": payload.get("data"), "error": payload.get("message")}, status_code=status)
+
+
 @app.get("/_ext/healthz")
 async def ext_healthz(request: Request):
     upstream_client = get_upstream_client(request.app)
     musicdl_client = get_musicdl_client(request.app)
     musicbox_client = get_musicbox_client(request.app)
+    qqmusic_client = get_qqmusic_client(request.app)
+    lx_source_client = get_lx_source_client(request.app)
 
     upstream_status = "fail"
     musicdl_status = "fail"
     musicbox_status = "fail"
+    qqmusic_status = "fail"
+    lx_source_status = "fail"
 
     try:
         r = await upstream_client.get("/music/api/v1/search/track?keyword=healthz_probe", timeout=2.0)
@@ -1323,7 +2058,7 @@ async def ext_healthz(request: Request):
     except Exception as e:
         logger.debug("Upstream health check failed: %s", e)
 
-    if not CONF.get("musicdl_enabled", True):
+    if not source_enabled("musicdl"):
         musicdl_status = "disabled"
     else:
         try:
@@ -1333,7 +2068,7 @@ async def ext_healthz(request: Request):
         except Exception as e:
             logger.debug("Musicdl health check failed: %s", e)
 
-    if not CONF["netease_enabled"]:
+    if not source_enabled("netease"):
         musicbox_status = "disabled"
     else:
         try:
@@ -1343,14 +2078,36 @@ async def ext_healthz(request: Request):
         except Exception as e:
             logger.debug("Musicbox health check failed: %s", e)
 
+    if not source_enabled("qqmusic"):
+        qqmusic_status = "disabled"
+    else:
+        try:
+            r = await qqmusic_client.get("/health", timeout=2.0)
+            if r.status_code == 200:
+                qqmusic_status = "ok"
+        except Exception as e:
+            logger.debug("QQ Music health check failed: %s", e)
+
+    if not source_enabled("lx"):
+        lx_source_status = "disabled"
+    else:
+        try:
+            r = await lx_source_client.get("/healthz", timeout=2.0)
+            if r.status_code == 200:
+                lx_source_status = "ok"
+        except Exception as e:
+            logger.debug("LX source health check failed: %s", e)
+
     llm_status = "enabled" if dailyrec.llm_enabled() else "disabled"
-    source_ok = musicdl_status == "ok" or musicbox_status == "ok"
+    source_ok = any(status == "ok" for status in (musicdl_status, musicbox_status, qqmusic_status))
 
     return {
         "ok": upstream_status == "ok" and source_ok,
         "upstream": upstream_status,
         "musicdl": musicdl_status,
         "musicbox": musicbox_status,
+        "qqmusic": qqmusic_status,
+        "lx_source": lx_source_status,
         "llm": llm_status,
     }
 
@@ -1361,6 +2118,7 @@ async def search_track(request: Request):
     upstream_client = get_upstream_client(request.app)
     musicdl_client = get_musicdl_client(request.app)
     musicbox_client = get_musicbox_client(request.app)
+    qqmusic_client = get_qqmusic_client(request.app)
     keyword = extract_keyword(request)
 
     page_str = request.query_params.get("page")
@@ -1429,18 +2187,29 @@ async def search_track(request: Request):
         entry: dict[str, Any] = {"items": [], "ts": time.time(), "task": None}
         mb_task: asyncio.Task | None = None
         mdl_task: asyncio.Task | None = None
-        if CONF["netease_enabled"]:
+        qq_task: asyncio.Task | None = None
+        if source_enabled("netease"):
             mb_task = asyncio.create_task(
                 fetch_musicbox_search(musicbox_client, keyword, CONF["netease_search_limit"])
             )
-        if CONF.get("musicdl_enabled", True):
+        if source_enabled("musicdl"):
             mdl_task = asyncio.create_task(
                 fetch_musicdl_search(musicdl_client, keyword, CONF["musicdl_search_limit"])
             )
+        if source_enabled("qqmusic"):
+            qq_task = asyncio.create_task(
+                fetch_qqmusic_search(qqmusic_client, keyword, CONF["qqmusic_search_limit"])
+            )
 
-        async def _bg_aggregator(e: dict, t_mb: asyncio.Task | None, t_mdl: asyncio.Task | None):
+        async def _bg_aggregator(
+            e: dict,
+            t_mb: asyncio.Task | None,
+            t_mdl: asyncio.Task | None,
+            t_qq: asyncio.Task | None,
+        ):
             mb_res = None
             mdl_res = None
+            qq_res = None
             if t_mb:
                 try:
                     mb_res = await t_mb
@@ -1451,24 +2220,39 @@ async def search_track(request: Request):
                     mdl_res = await t_mdl
                 except Exception as exc:
                     logger.warning("musicdl search bg failed: %s", exc)
+            if t_qq:
+                try:
+                    qq_res = await t_qq
+                except Exception as exc:
+                    logger.warning("QQ Music search bg failed: %s", exc)
             mb_list = mb_res if isinstance(mb_res, list) else []
             mdl_list = (
                 mdl_res.get("items", [])
                 if isinstance(mdl_res, dict) and isinstance(mdl_res.get("items"), list)
                 else []
             )
-            e["items"] = deduplicate_online_items(mb_list + mdl_list)
+            qq_list = qq_res if isinstance(qq_res, list) else []
+            e["items"] = deduplicate_online_items(qq_list + mb_list + mdl_list)
 
-        agg_task = asyncio.create_task(_bg_aggregator(entry, mb_task, mdl_task))
+        agg_task = asyncio.create_task(_bg_aggregator(entry, mb_task, mdl_task, qq_task))
         entry["task"] = agg_task
         _set_search_cache(keyword, entry)
 
         if page == 1:
-            if mb_task:
+            fast_tasks = [task for task in (qq_task, mb_task) if task is not None]
+            if fast_tasks:
                 try:
-                    mb_res = await asyncio.wait_for(asyncio.shield(mb_task), timeout=CONF["netease_wait_s"])
-                    if isinstance(mb_res, list) and not agg_task.done():
-                        entry["items"] = deduplicate_online_items(mb_res)
+                    done, _ = await asyncio.wait(
+                        fast_tasks, timeout=float(CONF["netease_wait_s"])
+                    )
+                    quick_items = []
+                    for task in fast_tasks:
+                        if task in done and not task.cancelled() and task.exception() is None:
+                            result = task.result()
+                            if isinstance(result, list):
+                                quick_items.extend(result)
+                    if quick_items and not agg_task.done():
+                        entry["items"] = deduplicate_online_items(quick_items)
                 except Exception:
                     pass
             elif mdl_task:
@@ -1492,6 +2276,105 @@ async def search_track(request: Request):
     return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
+def merge_online_entities(
+    upstream_json: dict, online_items: list[dict], page: int, size: int
+) -> dict:
+    target = ensure_search_list(upstream_json)
+    existing = {
+        str(item.get("name") or item.get("title") or "").strip().casefold()
+        for item in target
+        if isinstance(item, dict)
+    }
+    filtered = [
+        item
+        for item in online_items
+        if str(item.get("name") or "").strip().casefold() not in existing
+    ]
+    page_size = min(max(size, 1), max(int(CONF["online_limit"]), 1))
+    start = (max(page, 1) - 1) * page_size
+    target.extend(filtered[start : start + page_size])
+    data = upstream_json.get("data")
+    if isinstance(data, dict):
+        local_total = data.get("total")
+        if not isinstance(local_total, int):
+            local_total = len(target) - len(filtered[start : start + page_size])
+        data["total"] = local_total + len(filtered)
+    return upstream_json
+
+
+async def _search_entity(request: Request, entity_type: str) -> Response:
+    upstream_client = get_upstream_client(request.app)
+    envelope = await fetch_upstream_envelope(request, upstream_client)
+    if isinstance(envelope, Response):
+        return envelope
+    headers = envelope.pop("_ext_headers", {})
+    if envelope.get("code") != 0:
+        return JSONResponse(content=envelope, headers=headers)
+
+    keyword = extract_keyword(request)
+    if not keyword or not source_enabled("netease"):
+        return JSONResponse(content=envelope, headers=headers)
+    try:
+        page = max(int(request.query_params.get("page") or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(request.query_params.get("size") or 24)
+    except (TypeError, ValueError):
+        size = 24
+    if size < 1:
+        size = 24
+
+    cache_key = (entity_type, keyword.casefold())
+    cached = _ENTITY_SEARCH_CACHE.get(cache_key)
+    now = time.time()
+    if cached and now - float(cached.get("ts") or 0) < CONF["search_cache_ttl"]:
+        built = list(cached.get("items") or [])
+    else:
+        raw_items = await fetch_musicbox_entity_search(
+            get_musicbox_client(request.app), keyword, entity_type, CONF["online_limit"]
+        ) or []
+        builder = {
+            "artist": build_online_artist,
+            "album": build_online_album,
+            "playlist": build_online_playlist,
+        }[entity_type]
+        built = []
+        seen: set[tuple[str, str]] = set()
+        for raw in raw_items:
+            item = builder(raw)
+            if not item:
+                continue
+            artist_names = ",".join(
+                str(a.get("name") or "") for a in item.get("artists", []) if isinstance(a, dict)
+            )
+            dedupe_key = (str(item.get("name") or "").casefold(), artist_names.casefold())
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            built.append(item)
+        _ENTITY_SEARCH_CACHE[cache_key] = {"items": built, "ts": now}
+        _clean_search_cache()
+    return JSONResponse(
+        content=merge_online_entities(envelope, built, page=page, size=size), headers=headers
+    )
+
+
+@app.get("/music/api/v1/search/artist")
+async def search_artist(request: Request):
+    return await _search_entity(request, "artist")
+
+
+@app.get("/music/api/v1/search/album")
+async def search_album(request: Request):
+    return await _search_entity(request, "album")
+
+
+@app.get("/music/api/v1/search/playlist")
+async def search_playlist(request: Request):
+    return await _search_entity(request, "playlist")
+
+
 @app.get("/music/api/v1/search/suggest")
 @app.get("/music/api/v1/search/suggest/{subpath:path}")
 async def search_suggest(request: Request):
@@ -1499,7 +2382,6 @@ async def search_suggest(request: Request):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
-    musicdl_client = get_musicdl_client(request.app)
     keyword = extract_keyword(request)
 
     url_path = request.url.path
@@ -1507,17 +2389,11 @@ async def search_suggest(request: Request):
         url_path = f"{url_path}?{request.url.query}"
     headers = copy_incoming_headers(request)
 
-    musicdl_task: asyncio.Task | None = None
-    if keyword:
-        musicdl_task = asyncio.create_task(fetch_musicdl_search(musicdl_client, keyword, 5))
-
     req = upstream_client.build_request("GET", url_path, headers=headers)
     upstream_resp = await upstream_client.send(req)
     resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
 
     if upstream_resp.status_code != 200:
-        if musicdl_task:
-            musicdl_task.cancel()
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -1528,8 +2404,6 @@ async def search_suggest(request: Request):
     try:
         upstream_json = upstream_resp.json()
     except Exception:
-        if musicdl_task:
-            musicdl_task.cancel()
         return Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
@@ -1538,24 +2412,87 @@ async def search_suggest(request: Request):
         )
 
     if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
-        if musicdl_task:
-            musicdl_task.cancel()
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
-    musicdl_data = None
-    if musicdl_task:
-        try:
-            musicdl_data = await asyncio.wait_for(asyncio.shield(musicdl_task), timeout=10.0)
-        except Exception as e:
-            logger.warning("Suggest musicdl error: %s", e)
-            musicdl_task.cancel()
+    if not keyword:
+        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+    musicbox_client = get_musicbox_client(request.app)
+    tasks = [
+        fetch_musicdl_search(get_musicdl_client(request.app), keyword, 5)
+        if source_enabled("musicdl")
+        else asyncio.sleep(0, result=None),
+        fetch_musicbox_search(musicbox_client, keyword, 5)
+        if source_enabled("netease")
+        else asyncio.sleep(0, result=None),
+        fetch_musicbox_entity_search(musicbox_client, keyword, "album", 5)
+        if source_enabled("netease")
+        else asyncio.sleep(0, result=None),
+        fetch_musicbox_entity_search(musicbox_client, keyword, "artist", 5)
+        if source_enabled("netease")
+        else asyncio.sleep(0, result=None),
+        fetch_musicbox_entity_search(musicbox_client, keyword, "playlist", 5)
+        if source_enabled("netease")
+        else asyncio.sleep(0, result=None),
+    ]
+    try:
+        musicdl_data, musicbox_tracks, albums_raw, artists_raw, playlists_raw = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=12.0
+        )
+    except asyncio.TimeoutError:
+        musicdl_data, musicbox_tracks, albums_raw, artists_raw, playlists_raw = None, None, None, None, None
+
+    mdl_items = (
+        musicdl_data.get("items", [])
+        if isinstance(musicdl_data, dict) and isinstance(musicdl_data.get("items"), list)
+        else []
+    )
+    track_items = deduplicate_online_items(
+        (musicbox_tracks if isinstance(musicbox_tracks, list) else []) + mdl_items
+    )[:5]
 
     data_field = upstream_json.get("data")
-    if isinstance(data_field, list) and musicdl_data and "items" in musicdl_data:
-        for item in musicdl_data.get("items", [])[:5]:
+    if isinstance(data_field, list):
+        for item in track_items:
             title = item.get("title")
             if title and title not in data_field:
                 data_field.append(title)
+    elif isinstance(data_field, dict):
+        builders_and_raw = {
+            "album": (build_online_album, albums_raw),
+            "artist": (build_online_artist, artists_raw),
+            "playlist": (build_online_playlist, playlists_raw),
+        }
+        online_groups: dict[str, list[dict]] = {
+            "track": [build_online_track(item) for item in track_items]
+        }
+        for group, (builder, raw_items) in builders_and_raw.items():
+            online_groups[group] = [
+                built
+                for item in (raw_items if isinstance(raw_items, list) else [])
+                if isinstance(item, dict) and (built := builder(item)) is not None
+            ][:5]
+        for group, additions in online_groups.items():
+            container = data_field.get(group)
+            if not isinstance(container, dict):
+                container = {"items": [], "total": 0}
+                data_field[group] = container
+            key = "items" if isinstance(container.get("items"), list) else "list"
+            current = container.get(key)
+            if not isinstance(current, list):
+                current = []
+            known = {
+                str(item.get("guid") or item.get("name") or item.get("title") or "")
+                for item in current
+                if isinstance(item, dict)
+            }
+            for item in additions:
+                identity = str(item.get("guid") or item.get("name") or item.get("title") or "")
+                if identity and identity not in known:
+                    current.append(item)
+                    known.add(identity)
+            container[key] = current
+            container["total"] = max(int(container.get("total") or 0), len(current))
 
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
@@ -1626,6 +2563,9 @@ def stream_tee_response(
                 title = str((info or {}).get("title") or "")
                 artist = str((info or {}).get("artist") or "")
                 album = str((info or {}).get("album") or "")
+                lyric = str((info or {}).get("lyric") or "")
+                if lyric:
+                    write_lyric_cache(guid, lyric, title=title, artist=artist)
                 complete = written >= 1024 and (content_length is None or written == content_length)
                 if complete:
                     dest = library_media_path(guid, title, ext, artist=artist)
@@ -1672,6 +2612,41 @@ def stream_tee_response(
     return StreamingResponse(stream_no_cache(), status_code=status_code, headers=out_headers)
 
 
+async def stream_direct_online(
+    request: Request,
+    guid: str,
+    play_url: str,
+    range_header: str | None,
+    info: dict | None,
+    resolved_ext: str | None = None,
+) -> Response:
+    req_headers = {"Range": range_header} if range_header else {}
+    stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+    try:
+        stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
+        response = await stream_client.send(stream_req, stream=True)
+        if response.status_code >= 400:
+            await response.aclose()
+            await stream_client.aclose()
+            raise RuntimeError(f"direct source returned HTTP {response.status_code}")
+    except Exception as exc:
+        logger.warning("Failed to stream direct URL for %s: %s", guid, exc)
+        await stream_client.aclose()
+        return JSONResponse(
+            content={"code": 404, "msg": "online source unavailable", "data": None},
+            status_code=404,
+        )
+    return stream_tee_response(
+        response,
+        guid=guid,
+        range_header=range_header,
+        coro_factory=None if info is not None else (lambda: _online_info(request, guid)),
+        client_to_close=stream_client,
+        resolved_ext=resolved_ext,
+        pre_info=info,
+    )
+
+
 @app.get("/music/api/v1/track/stream")
 @app.get("/music/api/v1/track/stream/{subpath:path}")
 async def stream_track(request: Request):
@@ -1687,6 +2662,28 @@ async def stream_track(request: Request):
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
 
     src = source_from_online_guid(guid)
+    cached_info = _ONLINE_ENTITY_CACHE.get(guid)
+    if src == "qq":
+        song_mid = song_id_from_online_guid(guid).split(":")[-1]
+        play_url, resolved_ext, file_size = await resolve_qq_url(
+            get_qqmusic_client(request.app), song_mid
+        )
+        info = await _online_info(request, guid)
+        if isinstance(info, dict) and file_size:
+            info["file_size"] = file_size
+        if not play_url:
+            play_url = await resolve_lx_action(
+                request, guid, info or cached_info or {"id": song_mid, "source": "qq"}
+            )
+        if not isinstance(play_url, str) or not play_url.startswith(("http://", "https://")):
+            return JSONResponse(
+                content={"code": 404, "msg": "QQ Music account has no playable URL", "data": None},
+                status_code=404,
+            )
+        return await stream_direct_online(
+            request, guid, play_url, range_header, info, resolved_ext
+        )
+
     if src == "netease":
         musicbox_client = get_musicbox_client(request.app)
         raw_song_id = song_id_from_online_guid(guid)
@@ -1701,6 +2698,13 @@ async def stream_track(request: Request):
         info = None if isinstance(info_res, Exception) else info_res
 
         if not play_url:
+            play_url = await resolve_lx_action(
+                request,
+                guid,
+                info or cached_info or {"id": song_id, "source": "netease"},
+                quality="flac",
+            )
+        if not isinstance(play_url, str) or not play_url.startswith(("http://", "https://")):
             return JSONResponse(
                 content={"code": 404, "msg": "online source unavailable", "data": None},
                 status_code=404,
@@ -1708,37 +2712,8 @@ async def stream_track(request: Request):
 
         resolved_ext = str(info.get("ext")) if (isinstance(info, dict) and info.get("ext")) else None
 
-        req_headers = {}
-        if range_header:
-            req_headers["Range"] = range_header
-
-        stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-        try:
-            stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
-            resp = await stream_client.send(stream_req, stream=True)
-            if resp.status_code >= 400:
-                await resp.aclose()
-                await stream_client.aclose()
-                return JSONResponse(
-                    content={"code": 404, "msg": "online source unavailable", "data": None},
-                    status_code=404,
-                )
-        except Exception as e:
-            logger.warning("Failed to stream direct url %s for %s: %s", play_url, guid, e)
-            await stream_client.aclose()
-            return JSONResponse(
-                content={"code": 404, "msg": "online source unavailable", "data": None},
-                status_code=404,
-            )
-
-        return stream_tee_response(
-            resp,
-            guid=guid,
-            range_header=range_header,
-            coro_factory=None if info is not None else (lambda: _online_info(request, guid)),
-            client_to_close=stream_client,
-            resolved_ext=resolved_ext,
-            pre_info=info if isinstance(info, dict) else None,
+        return await stream_direct_online(
+            request, guid, play_url, range_header, info if isinstance(info, dict) else None, resolved_ext
         )
 
     musicdl_client = get_musicdl_client(request.app)
@@ -1758,6 +2733,16 @@ async def stream_track(request: Request):
 
     if resp.status_code in (404, 502) or resp.status_code >= 400:
         await resp.aclose()
+        lx_url = await resolve_lx_action(
+            request,
+            guid,
+            cached_info or {"id": song_id, "source": src},
+            quality="flac",
+        )
+        if isinstance(lx_url, str) and lx_url.startswith(("http://", "https://")):
+            return await stream_direct_online(
+                request, guid, lx_url, range_header, cached_info, None
+            )
         return JSONResponse(
             content={"code": 404, "msg": "online source unavailable", "data": None},
             status_code=404,
@@ -1828,6 +2813,40 @@ async def track_transcode(request: Request):
 
 async def _online_info(request: Request, guid: str) -> dict | None:
     src = source_from_online_guid(guid)
+    if src == "qq":
+        song_mid = song_id_from_online_guid(guid).split(":")[-1]
+        client = get_qqmusic_client(request.app)
+        cached = _ONLINE_ENTITY_CACHE.get(guid)
+        info = dict(cached) if isinstance(cached, dict) else {}
+        try:
+            response = await client.get("/song/detail", params={"mids": song_mid}, timeout=12.0)
+            if response.status_code == 200:
+                tracks = extract_qq_tracks(response.json())
+                if tracks:
+                    info.update(tracks[0])
+        except Exception as exc:
+            logger.warning("QQ Music detail failed for %s: %s", guid, exc)
+        try:
+            response = await client.get(
+                "/song/lyric", params={"mid": song_mid, "decode": 1}, timeout=12.0
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict):
+                    lyric = data.get("lyric") or ""
+                    if lyric:
+                        info["lyric"] = str(lyric)
+        except Exception as exc:
+            logger.warning("QQ Music lyric failed for %s: %s", guid, exc)
+        if info:
+            info.setdefault("id", f"qq:{song_mid}")
+            info.setdefault("source", "qq")
+            info.setdefault("qq_mid", song_mid)
+            _set_online_entity_cache(guid, {**info, "ts": time.time()})
+            return info
+        return None
+
     if src == "netease":
         musicbox_client = get_musicbox_client(request.app)
         raw_song_id = song_id_from_online_guid(guid)
@@ -1938,6 +2957,14 @@ async def track_metadata(request: Request, subpath: str = ""):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     data = await _online_info(request, guid) or stub_online_info(guid)
+    cached_audio = find_cache_file(guid)
+    if cached_audio and data.get("title") and data.get("artist"):
+        organize_cached_media(
+            guid,
+            cached_audio,
+            title=str(data.get("title") or ""),
+            artist=str(data.get("artist") or ""),
+        )
     cached_lyric = read_lyric_cache(guid)
     if cached_lyric:
         data = {**data, "lyric": cached_lyric}
@@ -2346,11 +3373,11 @@ async def _ensure_daily_task(request: Request, user_guid: str) -> asyncio.Task:
     task = asyncio.create_task(
         dailyrec.get_or_build_daily(
             user_guid=user_guid,
-            musicdl_client=get_musicdl_client(request.app) if CONF.get("musicdl_enabled", True) else None,
-            musicbox_client=get_musicbox_client(request.app) if CONF["netease_enabled"] else None,
+            musicdl_client=get_musicdl_client(request.app) if source_enabled("musicdl") else None,
+            musicbox_client=get_musicbox_client(request.app) if source_enabled("netease") else None,
             llm_http=get_llm_client(request.app) if dailyrec.llm_enabled() else None,
             build_track=build_online_track,
-            netease_enabled=CONF["netease_enabled"],
+            netease_enabled=source_enabled("netease"),
             favorite_items=favs,
         )
     )
@@ -2393,6 +3420,131 @@ async def _load_daily_bundle(request: Request, user_guid: str) -> dict:
         if cached and cached.get("tracks"):
             return cached
         return dailyrec.empty_daily_bundle(user_guid)
+
+
+def _online_entity_page(items: list[dict], request: Request) -> dict:
+    try:
+        page = max(int(request.query_params.get("page") or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(request.query_params.get("size") or 50)
+    except (TypeError, ValueError):
+        size = 50
+    if size == -1:
+        page_items = items
+    else:
+        size = max(size, 1)
+        start = (page - 1) * size
+        page_items = items[start : start + size]
+    return {"list": page_items, "total": len(items), "sort": request.query_params.get("sort") or ""}
+
+
+def _public_online_entity(bundle: dict, kind: str) -> dict:
+    common = {
+        "guid": bundle.get("guid"),
+        "id": bundle.get("guid"),
+        "name": bundle.get("name") or "在线内容",
+        "coverId": bundle.get("coverId") or "",
+        "trackCount": int(bundle.get("trackCount") or 0),
+        "isOnline": True,
+    }
+    if kind == "artist":
+        common["albumCount"] = int(bundle.get("albumCount") or 0)
+        common["alias"] = bundle.get("alias") or ""
+    elif kind == "album":
+        common["artists"] = list(bundle.get("artists") or [])
+        common["releaseYear"] = bundle.get("releaseYear")
+    elif kind == "playlist":
+        common["createdAt"] = int(bundle.get("createdAt") or time.time())
+        common["updatedAt"] = int(bundle.get("updatedAt") or time.time())
+        common["creatorName"] = bundle.get("creatorName") or ""
+    return common
+
+
+async def _online_entity_detail_response(request: Request, guid: str, kind: str) -> Response:
+    parsed = parse_online_entity_guid(guid)
+    if not parsed or parsed[0] not in {kind, f"{kind}-name"}:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    upstream_client = get_upstream_client(request.app)
+    is_authed, _, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+    bundle = await load_online_entity_bundle(request, guid)
+    if not bundle:
+        return JSONResponse(content={"code": 404, "msg": "online content unavailable", "data": None}, status_code=404)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": _public_online_entity(bundle, kind)})
+
+
+@app.get("/music/api/v1/artist/detail")
+async def online_artist_detail(request: Request):
+    guid = str(request.query_params.get("guid") or "").strip()
+    return await _online_entity_detail_response(request, guid, "artist")
+
+
+@app.get("/music/api/v1/album/detail")
+async def online_album_detail(request: Request):
+    guid = str(request.query_params.get("guid") or "").strip()
+    return await _online_entity_detail_response(request, guid, "album")
+
+
+async def _online_entity_tracks_response(
+    request: Request, guid: str, accepted_kinds: set[str]
+) -> Response:
+    parsed = parse_online_entity_guid(guid)
+    if not parsed or parsed[0] not in accepted_kinds:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    upstream_client = get_upstream_client(request.app)
+    is_authed, _, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+    bundle = await load_online_entity_bundle(request, guid)
+    if not bundle:
+        return JSONResponse(content={"code": 404, "msg": "online content unavailable", "data": None}, status_code=404)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": _online_entity_page(bundle.get("tracks") or [], request)})
+
+
+@app.get("/music/api/v1/track/artist-detail/list")
+async def online_artist_track_list(request: Request):
+    guid = str(
+        request.query_params.get("artistGUID")
+        or request.query_params.get("artistGuid")
+        or request.query_params.get("guid")
+        or ""
+    ).strip()
+    return await _online_entity_tracks_response(request, guid, {"artist", "artist-name"})
+
+
+@app.get("/music/api/v1/track/album-detail/list")
+async def online_album_track_list(request: Request):
+    guid = str(
+        request.query_params.get("albumGUID")
+        or request.query_params.get("albumGuid")
+        or request.query_params.get("guid")
+        or ""
+    ).strip()
+    return await _online_entity_tracks_response(request, guid, {"album"})
+
+
+@app.get("/music/api/v1/album/artist-detail/list")
+async def online_artist_album_list(request: Request):
+    guid = str(
+        request.query_params.get("artistGUID")
+        or request.query_params.get("artistGuid")
+        or request.query_params.get("guid")
+        or ""
+    ).strip()
+    parsed = parse_online_entity_guid(guid)
+    if not parsed or parsed[0] not in {"artist", "artist-name"}:
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    upstream_client = get_upstream_client(request.app)
+    is_authed, _, auth_resp = await _probe_upstream_auth(request, upstream_client)
+    if not is_authed and auth_resp is not None:
+        return auth_resp
+    bundle = await load_online_entity_bundle(request, guid)
+    if not bundle:
+        return JSONResponse(content={"code": 404, "msg": "online content unavailable", "data": None}, status_code=404)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": _online_entity_page(bundle.get("albums") or [], request)})
 
 
 def _playlist_public_fields(record: dict) -> dict:
@@ -2451,6 +3603,9 @@ async def playlist_list(request: Request):
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
     guid = str(request.query_params.get("guid") or "").strip()
+    parsed = parse_online_entity_guid(guid)
+    if parsed and parsed[0] == "playlist":
+        return await _online_entity_detail_response(request, guid, "playlist")
     if not dailyrec.is_daily_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -2512,6 +3667,9 @@ async def playlist_track_list(request: Request):
         or request.query_params.get("guid")
         or ""
     ).strip()
+    parsed = parse_online_entity_guid(guid)
+    if parsed and parsed[0] == "playlist":
+        return await _online_entity_tracks_response(request, guid, {"playlist"})
     if not dailyrec.is_daily_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 

@@ -404,7 +404,7 @@ def test_stream_track_netease_direct_stream_and_cache(tmp_path, monkeypatch):
         assert resp.headers.get("content-type") == "audio/flac"
 
         # 检查曲库落盘
-        saved_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac")
+        saved_file = os.path.join(CONF["library_dir"], "周杰伦", "晴天.flac")
         assert os.path.exists(saved_file)
         with open(saved_file, "rb") as f:
             assert f.read() == audio_content
@@ -483,7 +483,7 @@ def test_stream_track_early_disconnect_background_tee(tmp_path, monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", mock_client_init)
 
-    saved_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac")
+    saved_file = os.path.join(CONF["library_dir"], "周杰伦", "晴天.flac")
 
     with TestClient(app) as client:
         # 客户端只消费少量 chunk 后提前 break 断开连接
@@ -582,7 +582,7 @@ def test_stream_track_netease_mpeg_content_type_override_to_flac(tmp_path, monke
         assert resp.headers.get("content-type") == "audio/flac"
 
         # 检查曲库落盘文件为 .flac，而不是 .mp3
-        saved_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.flac")
+        saved_file = os.path.join(CONF["library_dir"], "周杰伦", "晴天.flac")
         assert os.path.exists(saved_file)
         with open(saved_file, "rb") as f:
             assert f.read() == audio_content

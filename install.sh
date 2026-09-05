@@ -6,6 +6,8 @@ set -euo pipefail
 # - 音源可多选、至少选一个：
 #     musicdl  https://github.com/CharlesPikachu/musicdl   (:8768)
 #     musicbox https://github.com/darknessomi/musicbox     (:8770)
+#     qqmusic  QQ 扫码登录、会员音质与搜索             (:8771)
+#     lx       洛雪自定义源隔离运行器                  (:8772)
 # - 可选开启每日推荐（OpenAI 兼容接口；不填则关闭）
 # - 不修改飞牛 nginx / 官方二进制 / 官方数据库写入
 # 用法:
@@ -28,9 +30,13 @@ RUN_EXTEND=0
 FIX_DOCKER_PERMISSIONS=0
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
+ENABLE_QQMUSIC=0
+ENABLE_LX=0
 PIP_INDEX="${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}"
 MUSICDL_REPO="${MUSICDL_REPO:-https://github.com/CharlesPikachu/musicdl}"
 MUSICBOX_REPO="${MUSICBOX_REPO:-https://github.com/darknessomi/musicbox}"
+QQMUSIC_REPO="${QQMUSIC_REPO:-https://github.com/Suxiaoqinx/QQMusicapi.git}"
+QQMUSIC_REF="${QQMUSIC_REF:-b6d748bb63fc65b6a98a383d8974fe3f3fd75d5b}"
 DOCKER_USE_SUDO=0
 
 log_info() { echo -e "\033[32m[INFO]\033[0m $*"; }
@@ -43,7 +49,7 @@ usage() {
 
   --mode host|docker     安装模式（host=宿主机 venv；docker=音源容器）
   --sources LIST         音源，逗号分隔，可多选，至少选一个
-                         取值: musicdl, musicbox（或 1, 2）
+                         取值: musicdl, musicbox, qqmusic, lx（或 1,2,3,4）
                          非交互缺省: musicdl
   --non-interactive      无交互，缺省值：mode=docker，音源=musicdl，不开启每日推荐
   --fix-docker-permissions
@@ -64,6 +70,8 @@ parse_sources() {
     local raw="${1:-}"
     ENABLE_MUSICDL=0
     ENABLE_MUSICBOX=0
+    ENABLE_QQMUSIC=0
+    ENABLE_LX=0
     raw="$(printf '%s' "${raw}" | tr '[:upper:]' '[:lower:]' | tr ' ' ',')"
     local IFS=','
     local part
@@ -75,14 +83,16 @@ parse_sources() {
         case "${part}" in
             1|musicdl|mdl) ENABLE_MUSICDL=1 ;;
             2|musicbox|netease|netease-musicbox) ENABLE_MUSICBOX=1 ;;
+            3|qq|qqmusic) ENABLE_QQMUSIC=1 ;;
+            4|lx|lx-source|luoxue) ENABLE_LX=1 ;;
             *)
-                log_err "未知音源: ${part}（可选 musicdl / musicbox）"
+                log_err "未知音源: ${part}（可选 musicdl / musicbox / qqmusic / lx）"
                 exit 1
                 ;;
         esac
     done
-    if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ]; then
-        log_err "至少选择一个音源（musicdl / musicbox）"
+    if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_QQMUSIC}" -eq 0 ]; then
+        log_err "至少选择一个可搜索音源（musicdl / musicbox / qqmusic）；lx 是播放地址兜底源"
         exit 1
     fi
 }
@@ -302,8 +312,10 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
         echo "请选择音源（可多选，逗号分隔，至少选一个）:"
         echo "  1) musicdl   — 聚合音源（酷我/咪咕等，覆盖热门流行）"
         echo "  2) musicbox  — 网易云音源（高品质/无损/歌词封面）"
-        echo "  1,2) 全部启用 — 两者兼得，双源并行（推荐）"
-        SOURCES_RAW="$(prompt "输入 1 / 2 / 1,2" "1,2")"
+        echo "  3) qqmusic   — QQ 音乐（扫码登录并使用账号会员权益）"
+        echo "  4) lx        — 洛雪自定义源（可在飞牛设置中增删）"
+        echo "  1,2,3,4) 全部启用 — 多源搜索 + 洛雪播放兜底（推荐）"
+        SOURCES_RAW="$(prompt "输入音源编号，逗号分隔" "1,2,3,4")"
     fi
     if [ -z "${ENABLE_RECOMMEND}" ]; then
         echo "大模型每日推荐歌单（可选选填）:"
@@ -365,6 +377,8 @@ parse_sources "${SOURCES_RAW}"
 SELECTED=""
 [ "${ENABLE_MUSICDL}" -eq 1 ] && SELECTED="${SELECTED} musicdl"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && SELECTED="${SELECTED} musicbox"
+[ "${ENABLE_QQMUSIC}" -eq 1 ] && SELECTED="${SELECTED} qqmusic"
+[ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lx"
 
 log_info "安装模式: ${MODE}"
 log_info "音源:${SELECTED}"
@@ -376,8 +390,12 @@ chmod 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
 
 MUSICDL_FLAG="false"
 MUSICBOX_FLAG="false"
+QQMUSIC_FLAG="false"
+LX_FLAG="false"
 [ "${ENABLE_MUSICDL}" -eq 1 ] && MUSICDL_FLAG="true"
 [ "${ENABLE_MUSICBOX}" -eq 1 ] && MUSICBOX_FLAG="true"
+[ "${ENABLE_QQMUSIC}" -eq 1 ] && QQMUSIC_FLAG="true"
+[ "${ENABLE_LX}" -eq 1 ] && LX_FLAG="true"
 
 # --- 写 .env（脱敏：不打印 key） ---
 ENV_PATH="${BASE_DIR}/.env"
@@ -395,10 +413,17 @@ umask 077
     echo "FNMUSIC_NETEASE_ENABLED='${MUSICBOX_FLAG}'"
     echo "FNMUSIC_MUSICDL_URL='http://127.0.0.1:8768'"
     echo "FNMUSIC_MUSICBOX_URL='http://127.0.0.1:8770'"
+    echo "FNMUSIC_QQMUSIC_ENABLED='${QQMUSIC_FLAG}'"
+    echo "FNMUSIC_QQMUSIC_URL='http://127.0.0.1:8771'"
+    echo "FNMUSIC_QQMUSIC_SEARCH_LIMIT='100'"
+    echo "FNMUSIC_QQMUSIC_QUALITY='F000'"
+    echo "FNMUSIC_LX_SOURCE_ENABLED='${LX_FLAG}'"
+    echo "FNMUSIC_LX_SOURCE_URL='http://127.0.0.1:8772'"
+    echo "FNMUSIC_SOURCE_CONFIG='$(dotenv_escape "${BASE_DIR}/source-config.json")'"
     echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     echo "FNMUSIC_ONLINE_LIMIT='100'"
     echo "FNMUSIC_NETEASE_SEARCH_LIMIT='100'"
-    echo "FNMUSIC_MUSICDL_SEARCH_LIMIT='30'"
+    echo "FNMUSIC_MUSICDL_SEARCH_LIMIT='100'"
     if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
         echo "FNMUSIC_LLM_BASE_URL='$(dotenv_escape "${LLM_BASE_URL}")'"
         echo "FNMUSIC_LLM_API_KEY='$(dotenv_escape "${LLM_API_KEY}")'"
@@ -553,6 +578,116 @@ EOF
     log_warn "musicbox systemd 已启动，但 healthz 尚未就绪，请检查 journalctl -u fnmusic-musicbox"
 }
 
+# --- QQ Music ---
+install_qqmusic_docker() {
+    log_info "构建并启动 QQ 音乐容器（固定版本 ${QQMUSIC_REF}）..."
+    sudo systemctl disable --now fnmusic-qqmusic.service 2>/dev/null || true
+    QQMUSIC_REPO="${QQMUSIC_REPO}" QQMUSIC_REF="${QQMUSIC_REF}" \
+        docker_cmd compose -f "${BASE_DIR}/docker-compose.yml" up -d --build qqmusic
+    if wait_http "http://127.0.0.1:8771/health" 60 2; then
+        log_info "QQ 音乐服务已就绪"
+        return 0
+    fi
+    log_err "等待 QQ 音乐服务超时"
+    return 1
+}
+
+install_qqmusic_host() {
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+        log_err "Host 模式启用 QQ 音乐需要 node>=18、npm 和 git"
+        return 1
+    fi
+    stop_docker_container fnmusic-qqmusic
+    local vendor="${BASE_DIR}/.vendor/qqmusic-api"
+    mkdir -p "${BASE_DIR}/.vendor" "${BASE_DIR}/qqmusic-data"
+    if [ ! -d "${vendor}/.git" ]; then
+        git clone "${QQMUSIC_REPO}" "${vendor}"
+    fi
+    git -C "${vendor}" fetch --depth 1 origin "${QQMUSIC_REF}"
+    git -C "${vendor}" checkout --detach "${QQMUSIC_REF}"
+    sed -i 's/app\.listen(PORT, () =>/app.listen(PORT, "127.0.0.1", () =>/' "${vendor}/src/server.js"
+    npm --prefix "${vendor}" pkg set dependencies.undici=6.28.1 overrides.qs=6.16.0
+    npm --prefix "${vendor}" install --omit=dev --ignore-scripts
+    local unit
+    unit="$(mktemp)"
+    cat > "${unit}" <<EOF
+[Unit]
+Description=fnmusic-ext QQ Music source (${QQMUSIC_REF})
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${vendor}
+Environment=PORT=8771
+Environment=PLATFORM=android
+Environment=DEVICE_PATH=${BASE_DIR}/qqmusic-data/device.json
+Environment=CREDENTIAL_PATH=${BASE_DIR}/qqmusic-data/credential.json
+ExecStart=$(command -v node) ${vendor}/src/server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    install_unit "${unit}" /etc/systemd/system/fnmusic-qqmusic.service || return 0
+    wait_http "http://127.0.0.1:8771/health" 30 1 || log_warn "QQ 音乐服务尚未就绪，请检查 journalctl -u fnmusic-qqmusic"
+}
+
+# --- LX custom source runner ---
+install_lx_docker() {
+    log_info "构建并启动洛雪自定义源隔离容器..."
+    sudo systemctl disable --now fnmusic-lx-source.service 2>/dev/null || true
+    docker_cmd compose -f "${BASE_DIR}/docker-compose.yml" up -d --build lx-source
+    if wait_http "http://127.0.0.1:8772/healthz" 30 2; then
+        log_info "洛雪自定义源服务已就绪"
+        return 0
+    fi
+    log_err "等待洛雪自定义源服务超时"
+    return 1
+}
+
+install_lx_host() {
+    if ! command -v node >/dev/null 2>&1; then
+        log_err "Host 模式启用洛雪自定义源需要 node>=20"
+        return 1
+    fi
+    stop_docker_container fnmusic-lx-source
+    local unit
+    unit="$(mktemp)"
+    cat > "${unit}" <<EOF
+[Unit]
+Description=fnmusic-ext LX custom source runner
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=fnmusic-lx-source
+WorkingDirectory=${BASE_DIR}/lx-source-service
+Environment=PORT=8772
+Environment=HOST=127.0.0.1
+Environment=LX_SOURCE_DATA_DIR=/var/lib/fnmusic-lx-source
+ExecStart=$(command -v node) ${BASE_DIR}/lx-source-service/server.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    install_unit "${unit}" /etc/systemd/system/fnmusic-lx-source.service || return 0
+    wait_http "http://127.0.0.1:8772/healthz" 30 1 || log_warn "洛雪自定义源服务尚未就绪，请检查 journalctl -u fnmusic-lx-source"
+}
+
 stop_unselected() {
     if [ "${ENABLE_MUSICDL}" -eq 0 ]; then
         stop_docker_container fnmusic-musicdl
@@ -562,18 +697,41 @@ stop_unselected() {
         stop_docker_container fnmusic-musicbox
         sudo systemctl disable --now fnmusic-musicbox.service 2>/dev/null || true
     fi
+    if [ "${ENABLE_QQMUSIC}" -eq 0 ]; then
+        stop_docker_container fnmusic-qqmusic
+        sudo systemctl disable --now fnmusic-qqmusic.service 2>/dev/null || true
+    fi
+    if [ "${ENABLE_LX}" -eq 0 ]; then
+        stop_docker_container fnmusic-lx-source
+        sudo systemctl disable --now fnmusic-lx-source.service 2>/dev/null || true
+    fi
 }
 
 if [ "${MODE}" = "docker" ]; then
     [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_docker
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_docker
+    [ "${ENABLE_QQMUSIC}" -eq 1 ] && install_qqmusic_docker
+    [ "${ENABLE_LX}" -eq 1 ] && install_lx_docker
 else
     [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_host
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_host
+    [ "${ENABLE_QQMUSIC}" -eq 1 ] && install_qqmusic_host
+    [ "${ENABLE_LX}" -eq 1 ] && install_lx_host
 fi
 stop_unselected
 
-python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py"
+if [ "${ENABLE_QQMUSIC}" -eq 1 ] || [ "${ENABLE_LX}" -eq 1 ]; then
+    log_info "安装飞牛音乐设置页的可恢复在线音源入口..."
+    mkdir -p "${BASE_DIR}/backup"
+    if ! sudo python3 "${BASE_DIR}/scripts/ui_hook.py" install \
+        --state "${BASE_DIR}/backup/ui-hook-files.json"; then
+        log_warn "未定位到飞牛音乐静态 index.html；将使用代理响应注入，或直接访问 /music/api/v1/_ext/settings。"
+    fi
+fi
+
+python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py" \
+    "${BASE_DIR}/proxy/online_sources.py" "${BASE_DIR}/proxy/source_registry.py" \
+    "${BASE_DIR}/scripts/ui_hook.py"
 bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh"
 
 log_info "============================================================"
@@ -594,6 +752,11 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "3. 网易云扫码登录（可选）："
     log_info "   部分网易云 VIP/无损歌曲需要账号凭证，可在局域网浏览器中访问："
     log_info "   http://<NAS_IP>:8770/api/v1/auth/login/qr.png 扫码登录即可。"
+fi
+if [ "${ENABLE_QQMUSIC}" -eq 1 ] || [ "${ENABLE_LX}" -eq 1 ]; then
+    log_info "4. 在线音源设置："
+    log_info "   打开飞牛音乐后点击右下角「在线音源」，可扫码登录 QQ、增删洛雪源。"
+    log_info "   也可直接访问: https://<NAS_IP>:5667/music/api/v1/_ext/settings"
 fi
 if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
     log_info "4. 大模型每日推荐："

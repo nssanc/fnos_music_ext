@@ -1,6 +1,8 @@
 # 可选音源（至少启用一个）
 # musicdl: https://github.com/CharlesPikachu/musicdl
 # musicbox: https://github.com/darknessomi/musicbox
+# qqmusic: https://github.com/Suxiaoqinx/QQMusicapi (pinned revision)
+# lx-source: LX Music custom-source compatibility runner
 services:
   musicdl:
     build:
@@ -14,7 +16,7 @@ services:
     environment:
       - MUSICDL_SOURCES=KuwoMusicClient,MiguMusicClient
       - MUSICDL_SEARCH_TIMEOUT=12
-      - MUSICDL_LIMIT_PER_SOURCE=30
+      - MUSICDL_LIMIT_PER_SOURCE=100
       - MUSICDL_URL_TTL=1800
       - MUSICDL_CACHE_MAX=3000
     restart: unless-stopped
@@ -43,3 +45,55 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  qqmusic:
+    build:
+      context: ./qqmusic-service
+      dockerfile: Dockerfile
+      args:
+        QQMUSIC_REPO: ${QQMUSIC_REPO:-https://github.com/Suxiaoqinx/QQMusicapi.git}
+        QQMUSIC_REF: ${QQMUSIC_REF:-b6d748bb63fc65b6a98a383d8974fe3f3fd75d5b}
+    container_name: fnmusic-qqmusic
+    ports:
+      - "127.0.0.1:8771:8000"
+    volumes:
+      - qqmusic-data:/data
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  lx-source:
+    build:
+      context: ./lx-source-service
+      dockerfile: Dockerfile
+    container_name: fnmusic-lx-source
+    ports:
+      - "127.0.0.1:8772:8000"
+    volumes:
+      - lx-source-data:/data
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  qqmusic-data:
+  lx-source-data:

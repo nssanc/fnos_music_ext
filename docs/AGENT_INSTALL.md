@@ -3,7 +3,7 @@
 本提示词专为 AI CLI Agent（如 OpenCode、Claude Code、Cursor 等）自动化部署与运维设计。
 人工详细安装步骤、部署模式差异与背景说明见：[人工安装与部署指南](INSTALL.md)。
 
-把下面代码块内的整段内容复制给 Agent。要求：只改本仓库与本机配置，禁止改飞牛系统文件，禁止把密钥写入 git。
+把下面代码块内的整段内容复制给 Agent。要求：只改本仓库与本机配置；除安装脚本管理、带标记且可恢复的前端入口注入外，不改飞牛系统文件；禁止把密钥写入 git。
 
 ```text
 你在一台已安装飞牛 NAS（fnOS）和「飞牛音乐」(trim.music) 的机器上工作。
@@ -14,12 +14,14 @@
 2. 禁止 patch trim-music 官方二进制，禁止写入官方 music.db（只读读取 play_history 进行口味分析可以）。
 3. 禁止把 API Key、密码、token 写进源码、测试、README、commit、issue 或 echo 打印到终端日志。所有密钥仅保存在仓库根目录 .env（文件权限 chmod 600）。
 4. 绝对禁止擅自安装 Docker 引擎：fnOS 的 Docker 必须在「应用中心」由系统管理员安装。若环境未安装 Docker，必须选用 Host 宿主机模式，严禁执行 apt-get install docker 等命令。
-5. 核心代理运行原则：无论选择 Docker 模式还是 Host 模式，核心代理服务（fnmusic-ext）都必须由宿主机 systemd（运行在项目根目录 .venv-proxy 独立虚拟环境中）原生管理，负责无侵入接管 /var/run/trim_music.socket。两种模式的区别仅在于「音源服务（musicdl / musicbox）」以何种方式运行与隔离。
+5. 核心代理运行原则：无论选择 Docker 模式还是 Host 模式，核心代理服务（fnmusic-ext）都必须由宿主机 systemd（运行在项目根目录 .venv-proxy 独立虚拟环境中）原生管理，负责无侵入接管 /var/run/trim_music.socket。两种模式的区别仅在于音源服务以何种方式运行与隔离。
 6. 一键扩展 ./extend.sh 与一键还原 ./restore.sh（含彻底清理 ./restore.sh --full）必须始终保持可用；扩展失败必须安全秒级回滚到官方直连。
 7. 音源组件与端口规划：
    - musicdl: https://github.com/CharlesPikachu/musicdl（负责酷我/咪咕聚合搜索与直链解析，服务仅监听本地 127.0.0.1:8768 本地回环，不对外暴露）。
    - musicbox: https://github.com/darknessomi/musicbox（负责网易云高品质解析，Docker 模式下映射 0.0.0.0:8770 绑定所有网络接口，以便局域网内用手机访问 http://<NAS-IP>:8770/api/v1/auth/login/qr.png 进行网易云 App 扫码登录；核心代理内部通过 127.0.0.1:8770 调用；登录凭证持久化隔离在 musicbox-data/）。
-   - 音源可多选、至少选一个。用户未指定时非交互默认仅 musicdl；用户需要网易云或双音源时使用 --sources musicdl,musicbox 或 --sources musicbox。
+   - qqmusic: 固定版本 QQMusicapi，监听 127.0.0.1:8771；只允许通过飞牛设置面板扫码授权，不收集账号密码，音质服从账号实际权益。
+   - lx-source: 洛雪自定义源运行器，监听 127.0.0.1:8772；Docker 模式使用非 root、只读根文件系统和独立 volume，Host 模式使用 DynamicUser 与 systemd 沙箱。
+   - 音源可多选、至少选择一个可搜索源。完整推荐组合为 --sources musicdl,musicbox,qqmusic,lx。
 
 【自动化部署执行步骤】
 
@@ -39,12 +41,12 @@
 
 步骤 3：执行安装与一步到位启用（--extend）
 推荐使用 --extend 参数，让 install.sh 在依赖就绪、服务配置完成后自动调用 ./extend.sh 进行 Unix Domain Socket 接管与端到端验收自检，实现安装+接管一步到位：
-  - Docker 模式（推荐，双音源一步到位）：
-    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox --extend
+  - Docker 模式（推荐，全部音源一步到位）：
+    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,qqmusic,lx --extend
   - Docker 模式（单音源）：
     ./install.sh --non-interactive --mode docker --sources musicdl --extend
   - Host 模式（宿主机独立 venv，双音源一步到位）：
-    ./install.sh --non-interactive --mode host --sources musicdl,musicbox --extend
+    ./install.sh --non-interactive --mode host --sources musicdl,musicbox,qqmusic,lx --extend
   - 若用户提供了 OpenAI 兼容的 Base URL 与 API Key，则追加大模型参数（密钥仅写入 .env，禁止 echo 到日志）：
     ./install.sh --non-interactive --mode docker --sources musicdl,musicbox \
       --enable-recommend \
@@ -63,7 +65,7 @@
   2. Shell 语法检查：
      bash -n extend.sh restore.sh install.sh proxy/run_proxy.sh
   3. Python 代码语法检查：
-     .venv-proxy/bin/python -m py_compile proxy/app.py proxy/recommend.py
+    .venv-proxy/bin/python -m py_compile proxy/app.py proxy/recommend.py proxy/online_sources.py proxy/source_registry.py scripts/ui_hook.py
      （可选运行自动化测试集：.venv-proxy/bin/python -m pytest proxy/tests -q）
 
 步骤 5：还原机制与彻底卸载规范（知悉与必要时使用）
@@ -72,7 +74,7 @@
     复位 Unix Socket，停用 fnmusic-ext 代理服务，秒级恢复官方直连；保留音源容器/服务及本地缓存数据，日后执行 ./extend.sh 可秒级重新上线。
   - 彻底清理卸载（系统级服务零残留）：
     ./restore.sh --full
-    在复位 Socket 并停用核心代理的同时，自动停止并删除音源 Docker 容器（fnmusic-musicdl、fnmusic-musicbox）或注销宿主机 systemd 音源服务（fnmusic-musicdl.service、fnmusic-musicbox.service）。
+    在复位 Socket 并停用核心代理的同时，自动停止并删除全部音源 Docker 容器或注销对应 systemd 音源服务；带标记的设置页入口也会被移除。
 
 【完成汇报规范】
 任务完成后用简短中文输出总结，内容包含：

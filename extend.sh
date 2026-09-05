@@ -12,6 +12,8 @@ TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 MUSICDL_URL="http://127.0.0.1:8768"
 MUSICBOX_URL="http://127.0.0.1:8770"
+QQMUSIC_URL="http://127.0.0.1:8771"
+LX_SOURCE_URL="http://127.0.0.1:8772"
 INSTALL_MODE="auto"
 
 log_info() {
@@ -59,13 +61,19 @@ source "${BASE_DIR}/.env"
 set +a
 MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
+QQMUSIC_URL="${FNMUSIC_QQMUSIC_URL:-${QQMUSIC_URL}}"
+LX_SOURCE_URL="${FNMUSIC_LX_SOURCE_URL:-${LX_SOURCE_URL}}"
 INSTALL_MODE="${FNMUSIC_INSTALL_MODE:-auto}"
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
+ENABLE_QQMUSIC=0
+ENABLE_LX=0
 is_enabled "${FNMUSIC_MUSICDL_ENABLED:-true}" && ENABLE_MUSICDL=1
 is_enabled "${FNMUSIC_NETEASE_ENABLED:-true}" && ENABLE_MUSICBOX=1
-if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ]; then
-    log_err "至少需要启用一个音源（FNMUSIC_MUSICDL_ENABLED / FNMUSIC_NETEASE_ENABLED）。"
+is_enabled "${FNMUSIC_QQMUSIC_ENABLED:-false}" && ENABLE_QQMUSIC=1
+is_enabled "${FNMUSIC_LX_SOURCE_ENABLED:-false}" && ENABLE_LX=1
+if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_QQMUSIC}" -eq 0 ]; then
+    log_err "至少需要启用一个可搜索音源（musicdl / musicbox / qqmusic）。"
     exit 1
 fi
 
@@ -155,7 +163,7 @@ try:
         if i: print(i)
 except Exception:
     pass" 2>/dev/null || true
-        else
+        elif [ "${source}" = "musicbox" ]; then
             curl -s --max-time 20 "${MUSICBOX_URL}/api/v1/search?keyword=${encoded}&limit=3&type=song" 2>/dev/null | python3 -c "import sys,json
 try:
     d=json.load(sys.stdin)
@@ -167,6 +175,25 @@ try:
         if sid: print('netease:'+sid)
 except Exception:
     pass" 2>/dev/null || true
+        else
+            curl -s --max-time 20 -H 'Content-Type: application/json' \
+                -d "{\"keyword\":\"${keyword}\",\"type\":0,\"num\":3,\"page\":1}" \
+                "${QQMUSIC_URL}/search/byType" 2>/dev/null | python3 -c "import sys,json
+try:
+    d=json.load(sys.stdin)
+    def walk(v):
+        if isinstance(v,dict):
+            if isinstance(v.get('list'),list):
+                for x in v['list']:
+                    if isinstance(x,dict):
+                        m=x.get('mid') or x.get('songmid')
+                        if m: print('qq:'+str(m))
+            for x in v.values(): walk(x)
+        elif isinstance(v,list):
+            for x in v: walk(x)
+    walk(d)
+except Exception:
+    pass" 2>/dev/null | awk '!seen[$0]++' || true
         fi
     }
 
@@ -206,6 +233,7 @@ except Exception:
     local sources=()
     [ "${ENABLE_MUSICDL}" -eq 1 ] && sources+=("musicdl")
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && sources+=("musicbox")
+    [ "${ENABLE_QQMUSIC}" -eq 1 ] && sources+=("qqmusic")
 
     local src kw id
     for src in "${sources[@]}"; do
@@ -285,7 +313,7 @@ docker_cmd() {
 }
 
 ensure_source() {
-    local name="$1" url="$2" compose_svc="$3" unit="$4"
+    local name="$1" url="$2" compose_svc="$3" unit="$4" health_path="${5:-/healthz}"
     # The two runtimes bind the same ports and must never run together.
     case "${INSTALL_MODE}" in
         docker)
@@ -297,8 +325,8 @@ ensure_source() {
                 || true
             ;;
     esac
-    if curl -sf --max-time 5 "${url}/healthz" >/dev/null 2>&1; then
-        log_info "${name} 已就绪 (${url}/healthz)。"
+    if curl -sf --max-time 5 "${url}${health_path}" >/dev/null 2>&1; then
+        log_info "${name} 已就绪 (${url}${health_path})。"
         return 0
     fi
     log_warn "${name} 未就绪，正在拉起..."
@@ -334,13 +362,13 @@ ensure_source() {
     esac
     local i
     for i in $(seq 1 60); do
-        if curl -sf --max-time 3 "${url}/healthz" >/dev/null 2>&1; then
+        if curl -sf --max-time 3 "${url}${health_path}" >/dev/null 2>&1; then
             log_info "${name} 已就绪。"
             return 0
         fi
         sleep 2
     done
-    log_err "等待 ${name} healthz 超时 (${url}/healthz)。"
+    log_err "等待 ${name} 健康检查超时 (${url}${health_path})。"
     return 1
 }
 
@@ -354,6 +382,12 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
         exit 1
     fi
 fi
+if [ "${ENABLE_QQMUSIC}" -eq 1 ]; then
+    ensure_source "qqmusic" "${QQMUSIC_URL}" "qqmusic" "fnmusic-qqmusic.service" "/health" || exit 1
+fi
+if [ "${ENABLE_LX}" -eq 1 ]; then
+    ensure_source "lx-source" "${LX_SOURCE_URL}" "lx-source" "fnmusic-lx-source.service" "/healthz" || exit 1
+fi
 
 # 1.5 检查 Python 虚拟环境与依赖
 if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
@@ -363,7 +397,8 @@ if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
 fi
 
 # 1.6 编译与语法检查
-python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py"
+python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py" \
+    "${BASE_DIR}/proxy/online_sources.py" "${BASE_DIR}/proxy/source_registry.py"
 bash -n "${BASE_DIR}/proxy/run_proxy.sh"
 
 # ------------------------------------------------------------------------------
@@ -464,6 +499,10 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "2. 网易云扫码登录（可选）："
     log_info "   若遇到部分网易云 VIP/无损歌曲需登录，可访问："
     log_info "   http://<NAS_IP>:8770/api/v1/auth/login/qr.png 使用网易云 App 扫码登录。"
+fi
+if [ "${ENABLE_QQMUSIC}" -eq 1 ] || [ "${ENABLE_LX}" -eq 1 ]; then
+    log_info "3. 在线音源设置："
+    log_info "   在飞牛音乐页面点击右下角「在线音源」，扫码登录 QQ 或增删洛雪源。"
 fi
 log_info "3. 健康检查与运维："
 log_info "   • 探测状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"

@@ -4,7 +4,7 @@ set -euo pipefail
 # ==============================================================================
 # fnmusic-ext 一键还原脚本 (Unix Socket 接管架构)
 # 功能：停用代理服务并复位 trim-music 原生 Unix Socket
-# 参数：--full 额外停止并删除音源容器/宿主机 unit（musicdl、musicbox）
+# 参数：--full 额外停止并删除全部音源容器/宿主机 unit
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +19,7 @@ for arg in "$@"; do
             ;;
         -h|--help)
             echo "用法: $0 [--full]"
-            echo "  --full: 还原 socket 与代理服务的同时，停止并删除 musicdl/musicbox 容器与宿主机 unit"
+            echo "  --full: 还原 socket 与代理服务的同时，停止并删除全部音源容器与宿主机 unit"
             exit 0
             ;;
         *)
@@ -55,6 +55,13 @@ if ! sudo -n true 2>/dev/null; then
         log_err "当前用户无法进行无密码 sudo 授权，无法执行还原。"
         exit 1
     fi
+fi
+
+# 移除可识别的前端入口标记；不会覆盖或回滚飞牛自身的其他更新。
+if [ -f "${BASE_DIR}/scripts/ui_hook.py" ]; then
+    log_info "移除飞牛音乐页面中的 fnmusic-ext 设置入口..."
+    sudo python3 "${BASE_DIR}/scripts/ui_hook.py" remove \
+        --state "${BASE_DIR}/backup/ui-hook-files.json" >/dev/null 2>&1 || true
 fi
 
 # 2. 停用并禁用代理服务
@@ -123,15 +130,19 @@ fi
 # 5. full 模式额外清理音源
 if [ "${FULL_RESTORE}" -eq 1 ]; then
     log_info "(--full 模式) 停止并移除音源容器与宿主机 unit..."
-    docker rm -f fnmusic-musicdl fnmusic-musicbox 2>/dev/null \
-        || sudo docker rm -f fnmusic-musicdl fnmusic-musicbox 2>/dev/null \
+    docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-qqmusic fnmusic-lx-source 2>/dev/null \
+        || sudo docker rm -f fnmusic-musicdl fnmusic-musicbox fnmusic-qqmusic fnmusic-lx-source 2>/dev/null \
         || true
     sudo systemctl disable --now fnmusic-musicdl.service 2>/dev/null || true
     sudo systemctl disable --now fnmusic-musicbox.service 2>/dev/null || true
+    sudo systemctl disable --now fnmusic-qqmusic.service 2>/dev/null || true
+    sudo systemctl disable --now fnmusic-lx-source.service 2>/dev/null || true
     sudo rm -f /etc/systemd/system/fnmusic-musicdl.service \
-        /etc/systemd/system/fnmusic-musicbox.service
+        /etc/systemd/system/fnmusic-musicbox.service \
+        /etc/systemd/system/fnmusic-qqmusic.service \
+        /etc/systemd/system/fnmusic-lx-source.service
     sudo systemctl daemon-reload 2>/dev/null || true
-    log_info "musicdl / musicbox 已停止。"
+    log_info "musicdl / musicbox / qqmusic / lx-source 已停止。"
 else
     log_info "默认保留音源容器/unit 与 cache/ 目录。"
 fi
