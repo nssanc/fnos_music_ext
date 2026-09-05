@@ -17,3 +17,17 @@ def test_ui_hook_is_idempotent_and_reversible(tmp_path):
     assert remove(index) is True
     assert remove(index) is False
     assert index.read_text(encoding="utf-8") == original
+
+
+def test_extension_assets_include_mobile_layout_and_safe_areas():
+    static = Path(__file__).resolve().parents[1] / "static"
+    css = (static / "ext-settings.css").read_text(encoding="utf-8")
+    script = (static / "ext-settings.js").read_text(encoding="utf-8")
+
+    for content in (css, script):
+        assert "@media(max-width:720px)" in content
+        assert "safe-area-inset-bottom" in content
+        assert "100dvh" in content
+    assert "font-size:16px" in script  # Prevent iOS form zoom.
+    assert "#fmx-player-source" in script
+    assert "aria-label','在线音源设置'" in script
