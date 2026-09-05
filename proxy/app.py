@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import glob
+import html
 import json
 import logging
 import os
@@ -186,6 +188,7 @@ _FORMAT_ALIASES = {
 _SEARCH_CACHE: dict[str, dict] = {}
 _ENTITY_SEARCH_CACHE: dict[tuple[str, str], dict] = {}
 _ONLINE_ENTITY_CACHE: dict[str, dict] = {}
+_COVER_CACHE: dict[str, dict] = {}
 
 
 def _clean_search_cache() -> None:
@@ -445,6 +448,18 @@ def repair_track_entity_links(track: dict) -> dict:
                     entry["guid"] = online_entity_guid(
                         "artist:name", str(entry.get("name") or artist).strip()
                     )
+    guid = str(track.get("guid") or "")
+    if guid not in _ONLINE_ENTITY_CACHE:
+        cover = str(track.get("cover_url") or track.get("coverUrl") or "")
+        _set_online_entity_cache(guid, {
+            "id": song_id_from_online_guid(guid),
+            "source": source_from_online_guid(guid),
+            "title": str(track.get("title") or ""),
+            "artist": artist,
+            "album": album_name,
+            "cover_url": cover if cover.startswith(("http://", "https://")) else "",
+            "ts": time.time(),
+        })
     return track
 
 
@@ -880,20 +895,64 @@ def lyric_cache_path(guid: str, title: str = "", artist: str = "") -> str:
     return os.path.join(d, f"{cache_safe_guid(guid)}.lrc")
 
 
+def normalize_timed_lyric(value: Any) -> str:
+    """Normalize LRC/QRC variants returned by QQ, NetEase, musicdl and LX."""
+    if isinstance(value, dict):
+        for key in ("lyric", "lrc", "content", "text"):
+            if value.get(key):
+                return normalize_timed_lyric(value[key])
+        return ""
+    if isinstance(value, list):
+        return "\n".join(filter(None, (normalize_timed_lyric(item) for item in value))).strip()
+    text = str(value or "").strip().lstrip("\ufeff")
+    if not text:
+        return ""
+    for _ in range(2):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+    qrc_attr = re.search(r'LyricContent=["\'](.*?)["\'](?:\s|/?>)', text, re.S | re.I)
+    if qrc_attr:
+        text = html.unescape(qrc_attr.group(1))
+
+    # Some QQ-compatible servers ignore decode=1 and still return base64 LRC.
+    if "[" not in text and len(text) >= 24 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", text):
+        try:
+            candidate = base64.b64decode("".join(text.split()), validate=True).decode("utf-8-sig")
+            if "[" in candidate:
+                text = candidate
+        except Exception:
+            pass
+
+    # QQ QRC uses [start_ms,duration_ms] and per-word (start,duration) marks.
+    def qrc_timestamp(match: re.Match[str]) -> str:
+        milliseconds = int(match.group(1))
+        minutes, remainder = divmod(milliseconds, 60000)
+        seconds, millis = divmod(remainder, 1000)
+        return f"[{minutes:02d}:{seconds:02d}.{millis:03d}]"
+
+    text = re.sub(r"\[(\d+),(\d+)\]", qrc_timestamp, text)
+    text = re.sub(r"\(\d+,\d+\)", "", text)
+    text = re.sub(r"\[(\d{1,3}):(\d{2})[,:](\d{1,3})\]", r"[\1:\2.\3]", text)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
+
+
 def read_lyric_cache(guid: str) -> str:
     path = find_lyric_file(guid)
     if not path:
         return ""
     try:
         with open(path, encoding="utf-8") as f:
-            return f.read().strip()
+            return normalize_timed_lyric(f.read())
     except Exception as e:
         logger.warning("Failed to read lyric cache %s: %s", path, e)
         return ""
 
 
 def write_lyric_cache(guid: str, text: str, title: str = "", artist: str = "") -> None:
-    text = (text or "").strip()
+    text = normalize_timed_lyric(text)
     if not text:
         return
     existing = find_lyric_file(guid)
@@ -991,7 +1050,7 @@ async def fetch_preferred_lyric(request: Request, guid: str, provider: str) -> s
                 )
                 payload = response.json() if response.status_code == 200 else {}
                 data = payload.get("data") if isinstance(payload, dict) else None
-                return str(data.get("lyric") or "").strip() if isinstance(data, dict) else ""
+                return normalize_timed_lyric(data.get("lyric")) if isinstance(data, dict) else ""
         elif provider == "qqmusic":
             items = await fetch_qqmusic_search(get_qqmusic_client(request.app), keyword, 10) or []
             match = _pick_lyric_match(items, title, artist)
@@ -1002,7 +1061,7 @@ async def fetch_preferred_lyric(request: Request, guid: str, provider: str) -> s
                 )
                 payload = response.json() if response.status_code == 200 else {}
                 data = payload.get("data") if isinstance(payload, dict) else None
-                return str(data.get("lyric") or "").strip() if isinstance(data, dict) else ""
+                return normalize_timed_lyric(data.get("lyric")) if isinstance(data, dict) else ""
         elif provider == "musicdl":
             payload = await fetch_musicdl_search(get_musicdl_client(request.app), keyword, 10) or {}
             items = payload.get("items") if isinstance(payload.get("items"), list) else []
@@ -1012,13 +1071,10 @@ async def fetch_preferred_lyric(request: Request, guid: str, provider: str) -> s
                     "/info", params={"id": str(match.get("id") or "")}, timeout=10.0
                 )
                 data = response.json() if response.status_code == 200 else {}
-                return str(data.get("lyric") or "").strip() if isinstance(data, dict) else ""
+                return normalize_timed_lyric(data.get("lyric")) if isinstance(data, dict) else ""
         elif provider == "lx":
             result = await resolve_lx_action(request, guid, info, action="lyric")
-            if isinstance(result, str):
-                return result.strip()
-            if isinstance(result, dict):
-                return str(result.get("lyric") or result.get("lrc") or "").strip()
+            return normalize_timed_lyric(result)
     except Exception as exc:
         logger.warning("preferred lyric source %s failed for %s: %s", provider, guid, exc)
     return ""
@@ -1028,7 +1084,7 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
     """本地 .lrc 优先；没有再向源站要，拿到就落盘。"""
     preferred = SOURCE_REGISTRY.preference("lyricSource")
     if preferred not in ("auto", "same"):
-        preferred_text = await fetch_preferred_lyric(request, guid, preferred)
+        preferred_text = normalize_timed_lyric(await fetch_preferred_lyric(request, guid, preferred))
         if preferred_text:
             info = _ONLINE_ENTITY_CACHE.get(guid) or {}
             write_lyric_cache(
@@ -1055,7 +1111,7 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
                 if isinstance(res_data, dict) and res_data.get("ok") is not False:
                     l_data = res_data.get("data")
                     if isinstance(l_data, dict):
-                        lyric_text = str(l_data.get("lyric") or "").strip()
+                        lyric_text = normalize_timed_lyric(l_data.get("lyric"))
                         if lyric_text:
                             write_lyric_cache(guid, lyric_text)
                             return lyric_text
@@ -1064,7 +1120,7 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
         return ""
 
     data = await _online_info(request, guid)
-    text = str((data or {}).get("lyric") or "").strip()
+    text = normalize_timed_lyric((data or {}).get("lyric"))
     if text:
         write_lyric_cache(
             guid,
@@ -1823,7 +1879,7 @@ def build_lyric_list_payload(guid: str, lyric_text: str) -> dict:
 
     每条需有非空 content；source=2 表示 EXTERNAL_LRC（非内嵌，不强制 offset）。
     """
-    text = (lyric_text or "").strip()
+    text = normalize_timed_lyric(lyric_text)
     if not text:
         return {"code": 0, "msg": "ok", "data": {"list": [], "preferred": ""}}
     lyric_guid = f"{guid}:lyric"
@@ -2146,6 +2202,46 @@ async def ext_source_preferences(request: Request):
         "audioSource": SOURCE_REGISTRY.preference("audioSource"),
         "lyricSource": SOURCE_REGISTRY.preference("lyricSource"),
     }}
+
+
+@app.post("/music/api/v1/_ext/resolve-track-source")
+async def ext_resolve_track_source(request: Request):
+    """Resolve the currently playing song on a user-selected source."""
+    await require_ext_access(request, mutation=True)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid request")
+    guid = str(body.get("guid") or "").strip()
+    provider = str(body.get("source") or "").strip().lower()
+    if provider not in {"qqmusic", "netease", "musicdl"}:
+        raise HTTPException(status_code=400, detail="invalid source")
+    if not source_enabled(provider):
+        raise HTTPException(status_code=400, detail="该音乐源未启用")
+
+    current = dict(_ONLINE_ENTITY_CACHE.get(guid) or {})
+    title = str(body.get("title") or current.get("title") or current.get("name") or "").strip()
+    artist = str(body.get("artist") or current.get("artist") or "").strip()
+    if not title and is_online_guid(guid):
+        current.update(await _online_info(request, guid) or {})
+        title = str(current.get("title") or current.get("name") or "").strip()
+        artist = str(current.get("artist") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="无法识别当前歌曲")
+
+    keyword = " ".join(part for part in (title, artist) if part)
+    tracks = await search_source_tracks(request, provider, keyword, 12)
+    match = _pick_lyric_match(tracks, title, artist)
+    if not match:
+        raise HTTPException(status_code=404, detail="所选音乐源没有找到这首歌")
+    resolved_guid = online_guid_from_item(match)
+    _set_online_entity_cache(resolved_guid, {**match, "ts": time.time()})
+    return {
+        "ok": True,
+        "track": build_online_track(match),
+        "streamUrl": f"/music/api/v1/track/stream?guid={quote(resolved_guid, safe='')}",
+        "source": provider,
+        "sourceName": source_label(str(match.get("source") or provider)),
+    }
 
 
 @app.patch("/music/api/v1/_ext/sources/{source_id}")
@@ -3177,6 +3273,60 @@ async def track_metadata(request: Request, subpath: str = ""):
     return JSONResponse(content=build_metadata_payload(guid, data))
 
 
+async def resolve_fallback_cover(request: Request, guid: str, info: dict | None) -> str:
+    cached = _COVER_CACHE.get(guid)
+    if cached and time.time() - float(cached.get("ts") or 0) < CONF["search_cache_ttl"]:
+        return str(cached.get("url") or "")
+
+    item = dict(info or _ONLINE_ENTITY_CACHE.get(guid) or {})
+    title = str(item.get("title") or item.get("name") or "").strip()
+    artist = str(item.get("artist") or "").strip()
+    if not title:
+        _COVER_CACHE[guid] = {"url": "", "ts": time.time()}
+        return ""
+    keyword = " ".join(part for part in (title, artist) if part)
+    preferred = SOURCE_REGISTRY.preference("audioSource")
+    providers = ["qqmusic", "netease"]
+    if preferred in providers:
+        providers.remove(preferred)
+        providers.insert(0, preferred)
+
+    url = ""
+    for provider in providers:
+        try:
+            tracks = await search_source_tracks(request, provider, keyword, 10)
+            match = _pick_lyric_match(tracks, title, artist)
+            candidate = str((match or {}).get("cover_url") or "")
+            if candidate.startswith(("http://", "https://")):
+                url = candidate
+                break
+        except Exception as exc:
+            logger.warning("fallback cover source %s failed for %s: %s", provider, guid, exc)
+    _COVER_CACHE[guid] = {"url": url, "ts": time.time()}
+    if url:
+        _set_online_entity_cache(guid, {**item, "cover_url": url, "ts": time.time()})
+    return url
+
+
+async def search_source_tracks(
+    request: Request, provider: str, keyword: str, limit: int = 10
+) -> list[dict]:
+    """Search one configured source using its canonical family name."""
+    if provider == "qqmusic" and source_enabled("qqmusic"):
+        return await fetch_qqmusic_search(get_qqmusic_client(request.app), keyword, limit) or []
+    if provider == "netease" and source_enabled("netease"):
+        return await fetch_musicbox_search(get_musicbox_client(request.app), keyword, limit) or []
+    if provider == "musicdl" and source_enabled("musicdl"):
+        payload = await fetch_musicdl_search(get_musicdl_client(request.app), keyword, limit) or {}
+        return payload.get("items") if isinstance(payload.get("items"), list) else []
+    return []
+
+
+def placeholder_cover() -> Response:
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#5b5ce2"/><stop offset="1" stop-color="#25273d"/></linearGradient></defs><rect width="600" height="600" rx="48" fill="url(#g)"/><circle cx="236" cy="410" r="72" fill="#fff" fill-opacity=".92"/><circle cx="426" cy="352" r="72" fill="#fff" fill-opacity=".92"/><path d="M294 164v246M484 108v244M294 164l190-56v82l-190 56" fill="none" stroke="#fff" stroke-width="38" stroke-linejoin="round"/></svg>"""
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
@@ -3199,9 +3349,11 @@ async def static_cover(request: Request, subpath: str = ""):
 
     data = await _online_info(request, guid)
     cover = (data or {}).get("cover_url") or ""
+    if not cover:
+        cover = await resolve_fallback_cover(request, guid, data)
     if cover:
         return RedirectResponse(cover, status_code=302)
-    return empty_ok()
+    return placeholder_cover()
 
 
 # === online favorites ===

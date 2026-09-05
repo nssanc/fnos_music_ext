@@ -8,6 +8,7 @@ from proxy.app import (
     app,
     CONF,
     SOURCE_REGISTRY,
+    _COVER_CACHE,
     _ENTITY_SEARCH_CACHE,
     _ONLINE_ENTITY_CACHE,
     _SEARCH_CACHE,
@@ -15,6 +16,7 @@ from proxy.app import (
     build_online_track,
     find_cache_file,
     library_basename,
+    normalize_timed_lyric,
     remember_media_path,
     repair_track_entity_links,
     write_audio_tags,
@@ -58,6 +60,7 @@ def setup_test_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
     _ENTITY_SEARCH_CACHE.clear()
     _ONLINE_ENTITY_CACHE.clear()
+    _COVER_CACHE.clear()
     cache_dir = str(tmp_path / "cache")
     library_dir = str(tmp_path / "library")
     fav_dir = str(tmp_path / "online_favorites")
@@ -205,6 +208,31 @@ def test_ext_source_settings_are_authenticated_and_persist_toggle(tmp_path):
         )
         assert updated.status_code == 200
         assert SOURCE_REGISTRY.enabled("qqmusic") is True
+
+
+def test_resolve_current_track_to_qqmusic(monkeypatch):
+    monkeypatch.setitem(CONF, "qqmusic_enabled", True)
+    _ONLINE_ENTITY_CACHE["online:migu:123"] = {"title": "晴天", "artist": "周杰伦"}
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"code": 0, "data": {"name": "NAS"}})),
+        base_url="http://unix",
+    )
+    app.state.qqmusic_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"code": 0, "data": {"item_song": [{"mid": "qqmid", "name": "晴天", "singer": [{"name": "周杰伦"}], "album": {"name": "叶惠美", "mid": "album1"}}]}})),
+        base_url="http://qqmusic",
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/music/api/v1/_ext/resolve-track-source",
+            json={"guid": "online:migu:123", "source": "qqmusic"},
+            headers={"X-FnMusic-Ext": "1"},
+        )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["track"]["guid"] == "online:qq:qqmid"
+    assert "online%3Aqq%3Aqqmid" in payload["streamUrl"]
+    assert payload["sourceName"] == "QQ音乐"
 
 
 def test_qq_qrcode_check_never_exposes_credential():
@@ -1137,6 +1165,16 @@ def test_online_lyrics_and_metadata():
         assert rj2["data"]["track"]["hasLyric"] is True
 
 
+def test_lyric_normalizer_supports_qq_qrc_html_base64_and_other_lrc_sources():
+    qq_qrc = '<Lyric_1 LyricContent="[1234,2000]你(1234,400)好(1634,400)&#10;[4000,2000]世界"/>'
+    assert normalize_timed_lyric(qq_qrc) == "[00:01.234]你好\n[00:04.000]世界"
+
+    encoded = "WzAwOjAxLjAwXeaZtOWkqQ=="  # [00:01.00]晴天
+    assert normalize_timed_lyric(encoded) == "[00:01.00]晴天"
+
+    assert normalize_timed_lyric("[00:02,50]咪咕\\n[00:04.000]洛雪") == "[00:02.50]咪咕\n[00:04.000]洛雪"
+
+
 def test_online_lyrics_and_metadata_musicdl_error():
     """在线歌词/元数据获取失败时，安全返回 code 0 和空 data，绝不 500。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:
@@ -1993,6 +2031,35 @@ def test_static_cover_online_coverid_redirect():
         )
         assert resp.status_code == 302
         assert resp.headers.get("location") == cover_target
+
+
+def test_static_cover_falls_back_to_qqmusic(monkeypatch):
+    monkeypatch.setitem(CONF, "qqmusic_enabled", True)
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "id": "migu:123", "title": "晴天", "artist": "周杰伦"})
+
+    def qq_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path in ("/search/byType", "/search/general")
+        return httpx.Response(200, json={"code": 0, "data": {"item_song": [{"mid": "mid1", "name": "晴天", "singer": [{"name": "周杰伦"}], "album": {"name": "叶惠美", "mid": "album1"}}]}})
+
+    app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(musicdl_handler), base_url="http://musicdl")
+    app.state.qqmusic_client = httpx.AsyncClient(transport=httpx.MockTransport(qq_handler), base_url="http://qqmusic")
+    with TestClient(app) as client:
+        response = client.get("/music/api/v1/static/cover?coverId=online:migu:123", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://y.qq.com/music/photo_new/T002R500x500M000album1.jpg"
+
+
+def test_static_cover_returns_svg_placeholder_when_all_sources_miss(monkeypatch):
+    monkeypatch.setitem(CONF, "musicdl_enabled", False)
+    monkeypatch.setitem(CONF, "netease_enabled", False)
+    monkeypatch.setitem(CONF, "qqmusic_enabled", False)
+    with TestClient(app) as client:
+        response = client.get("/music/api/v1/static/cover?coverId=online:migu:missing")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert b"<svg" in response.content
 
 
 def test_static_cover_local_coverid_passthrough():
