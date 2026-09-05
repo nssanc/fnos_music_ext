@@ -103,6 +103,38 @@ def source_enabled(source_id: str) -> bool:
     }.get(source_id)
     return bool(CONF.get(conf_key, False)) if conf_key else False
 
+
+SOURCE_LABELS = {
+    "qq": "QQ音乐",
+    "qqmusic": "QQ音乐",
+    "netease": "网易云",
+    "kuwo": "酷我",
+    "migu": "咪咕",
+    "kugou": "酷狗",
+    "lx": "洛雪",
+    "musicdl": "聚合源",
+}
+
+
+def source_family(source_id: str) -> str:
+    source_id = (source_id or "").lower()
+    if source_id == "qq":
+        return "qqmusic"
+    if source_id in ("kuwo", "migu", "kugou", "musicdl"):
+        return "musicdl"
+    return source_id
+
+
+def source_label(source_id: str) -> str:
+    return SOURCE_LABELS.get((source_id or "").lower(), source_id or "在线")
+
+
+def order_online_items(items: list[dict]) -> list[dict]:
+    preferred = SOURCE_REGISTRY.preference("audioSource")
+    if preferred == "auto":
+        return items
+    return sorted(items, key=lambda item: source_family(str(item.get("source") or "")) != preferred)
+
 _REDACT_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
 
 HOP_BY_HOP = {
@@ -190,14 +222,14 @@ def _set_online_entity_cache(guid: str, entry: dict) -> None:
 
 
 def deduplicate_online_items(items: list[dict]) -> list[dict]:
-    """在线条目合并去重：按 (title, artist) 小写，保留最先出现的（musicbox 优先）。"""
+    """同一音源内去重；跨音源同名歌曲保留，便于用户切换版本。"""
     seen = set()
     res = []
     for it in items:
         t = str(it.get("title") or it.get("name") or "").strip().lower()
         a = str(it.get("artist") or "").strip().lower()
         if t and a:
-            key = (t, a)
+            key = (source_family(str(it.get("source") or "")), t, a)
             if key in seen:
                 continue
             seen.add(key)
@@ -285,8 +317,10 @@ def build_online_track(item: dict) -> dict:
     _set_online_entity_cache(guid, {**item, "ts": time.time()})
     src = str(item.get("source") or source_from_online_guid(guid) or "")
     title = str(item.get("title") or item.get("name") or "")
+    label = source_label(src)
     artist = str(item.get("artist") or "")
     album = str(item.get("album") or "")
+    display_album = f"{album} 〔{label}〕" if album else f"〔{label}〕"
     duration_s = item.get("duration_s") or 0
     try:
         duration_s = float(duration_s)
@@ -306,7 +340,7 @@ def build_online_track(item: dict) -> dict:
 
     artists_list = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
     album_obj = {
-        "name": album,
+        "name": display_album,
         "guid": f"{guid}:album",
         "artists": artists_list,
         "coverId": guid,
@@ -333,7 +367,9 @@ def build_online_track(item: dict) -> dict:
         "artist": artist,
         "artists": artists_list,
         "album": album_obj,
-        "albumName": album,
+        "albumName": display_album,
+        "originalAlbum": album,
+        "subtitle": f"来源：{label}",
         "audioSpec": audio_spec,
         "duration": duration_ms,
         "duration_ms": duration_ms,
@@ -350,6 +386,8 @@ def build_online_track(item: dict) -> dict:
         "coverUrl": cover,
         "coverURL": cover,
         "source": src,
+        "sourceName": label,
+        "sourceLabel": label,
         "is_online": True,
         "isFavorite": False,
         "isCue": False,
@@ -870,8 +908,86 @@ async def cache_lyrics_from_musicdl(musicdl_client: httpx.AsyncClient, guid: str
         return None
 
 
+def _pick_lyric_match(items: list[dict], title: str, artist: str) -> dict | None:
+    wanted_title = title.strip().casefold()
+    wanted_artist = artist.strip().casefold()
+    for item in items:
+        item_title = str(item.get("title") or item.get("name") or "").strip().casefold()
+        item_artist = str(item.get("artist") or "").strip().casefold()
+        if item_title == wanted_title and (not wanted_artist or wanted_artist in item_artist or item_artist in wanted_artist):
+            return item
+    return items[0] if items else None
+
+
+async def fetch_preferred_lyric(request: Request, guid: str, provider: str) -> str:
+    info = dict(_ONLINE_ENTITY_CACHE.get(guid) or {})
+    if not info:
+        info = dict(await _online_info(request, guid) or {})
+    title = str(info.get("title") or info.get("name") or "").strip()
+    artist = str(info.get("artist") or "").strip()
+    if not title:
+        return ""
+    keyword = " ".join(part for part in (title, artist) if part)
+
+    try:
+        if provider == "netease":
+            items = await fetch_musicbox_search(get_musicbox_client(request.app), keyword, 10) or []
+            match = _pick_lyric_match(items, title, artist)
+            if match:
+                song_id = str(match.get("id") or "").split(":")[-1]
+                response = await get_musicbox_client(request.app).get(
+                    f"/api/v1/song/{song_id}/lyric", timeout=10.0
+                )
+                payload = response.json() if response.status_code == 200 else {}
+                data = payload.get("data") if isinstance(payload, dict) else None
+                return str(data.get("lyric") or "").strip() if isinstance(data, dict) else ""
+        elif provider == "qqmusic":
+            items = await fetch_qqmusic_search(get_qqmusic_client(request.app), keyword, 10) or []
+            match = _pick_lyric_match(items, title, artist)
+            if match:
+                song_mid = str(match.get("qq_mid") or match.get("id") or "").split(":")[-1]
+                response = await get_qqmusic_client(request.app).get(
+                    "/song/lyric", params={"mid": song_mid, "decode": 1}, timeout=12.0
+                )
+                payload = response.json() if response.status_code == 200 else {}
+                data = payload.get("data") if isinstance(payload, dict) else None
+                return str(data.get("lyric") or "").strip() if isinstance(data, dict) else ""
+        elif provider == "musicdl":
+            payload = await fetch_musicdl_search(get_musicdl_client(request.app), keyword, 10) or {}
+            items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            match = _pick_lyric_match(items, title, artist)
+            if match:
+                response = await get_musicdl_client(request.app).get(
+                    "/info", params={"id": str(match.get("id") or "")}, timeout=10.0
+                )
+                data = response.json() if response.status_code == 200 else {}
+                return str(data.get("lyric") or "").strip() if isinstance(data, dict) else ""
+        elif provider == "lx":
+            result = await resolve_lx_action(request, guid, info, action="lyric")
+            if isinstance(result, str):
+                return result.strip()
+            if isinstance(result, dict):
+                return str(result.get("lyric") or result.get("lrc") or "").strip()
+    except Exception as exc:
+        logger.warning("preferred lyric source %s failed for %s: %s", provider, guid, exc)
+    return ""
+
+
 async def resolve_online_lyric(request: Request, guid: str) -> str:
     """本地 .lrc 优先；没有再向源站要，拿到就落盘。"""
+    preferred = SOURCE_REGISTRY.preference("lyricSource")
+    if preferred not in ("auto", "same"):
+        preferred_text = await fetch_preferred_lyric(request, guid, preferred)
+        if preferred_text:
+            info = _ONLINE_ENTITY_CACHE.get(guid) or {}
+            write_lyric_cache(
+                guid,
+                preferred_text,
+                title=str(info.get("title") or ""),
+                artist=str(info.get("artist") or ""),
+            )
+            return preferred_text
+
     cached = read_lyric_cache(guid)
     if cached:
         return cached
@@ -1950,7 +2066,33 @@ async def ext_sources(request: Request):
         "builtins": builtins,
         "lxSources": lx_payload.get("sources") if isinstance(lx_payload.get("sources"), list) else [],
         "qq": qq_summary,
+        "preferences": {
+            "audioSource": SOURCE_REGISTRY.preference("audioSource"),
+            "lyricSource": SOURCE_REGISTRY.preference("lyricSource"),
+        },
     }
+
+
+@app.patch("/music/api/v1/_ext/preferences")
+async def ext_source_preferences(request: Request):
+    await require_ext_access(request, mutation=True)
+    body = await request.json()
+    allowed = {
+        "audioSource": {"auto", "qqmusic", "netease", "musicdl"},
+        "lyricSource": {"auto", "same", "qqmusic", "netease", "musicdl", "lx"},
+    }
+    if not isinstance(body, dict) or not body:
+        raise HTTPException(status_code=400, detail="preference is required")
+    for key, value in body.items():
+        if key not in allowed or value not in allowed[key]:
+            raise HTTPException(status_code=400, detail=f"invalid {key}")
+    for key, value in body.items():
+        SOURCE_REGISTRY.set_preference(key, value)
+    _SEARCH_CACHE.clear()
+    return {"ok": True, "preferences": {
+        "audioSource": SOURCE_REGISTRY.preference("audioSource"),
+        "lyricSource": SOURCE_REGISTRY.preference("lyricSource"),
+    }}
 
 
 @app.patch("/music/api/v1/_ext/sources/{source_id}")
@@ -2232,7 +2374,9 @@ async def search_track(request: Request):
                 else []
             )
             qq_list = qq_res if isinstance(qq_res, list) else []
-            e["items"] = deduplicate_online_items(qq_list + mb_list + mdl_list)
+            e["items"] = order_online_items(
+                deduplicate_online_items(qq_list + mb_list + mdl_list)
+            )
 
         agg_task = asyncio.create_task(_bg_aggregator(entry, mb_task, mdl_task, qq_task))
         entry["task"] = agg_task
@@ -2252,7 +2396,7 @@ async def search_track(request: Request):
                             if isinstance(result, list):
                                 quick_items.extend(result)
                     if quick_items and not agg_task.done():
-                        entry["items"] = deduplicate_online_items(quick_items)
+                        entry["items"] = order_online_items(deduplicate_online_items(quick_items))
                 except Exception:
                     pass
             elif mdl_task:
@@ -2261,7 +2405,9 @@ async def search_track(request: Request):
                         asyncio.shield(mdl_task), timeout=min(float(CONF["search_timeout"]), 4.0)
                     )
                     if isinstance(mdl_res, dict) and not agg_task.done():
-                        entry["items"] = deduplicate_online_items(mdl_res.get("items") or [])
+                        entry["items"] = order_online_items(
+                            deduplicate_online_items(mdl_res.get("items") or [])
+                        )
                 except Exception:
                     pass
         else:

@@ -20,3 +20,10 @@ def test_source_registry_rejects_unknown_source(tmp_path):
     registry = SourceRegistry(str(tmp_path / "sources.json"), {"qq": False})
     with pytest.raises(KeyError):
         registry.set_enabled("unknown", True)
+
+
+def test_source_registry_persists_preferences(tmp_path):
+    registry = SourceRegistry(str(tmp_path / "sources.json"), {"qq": True})
+    assert registry.preference("audioSource") == "auto"
+    registry.set_preference("audioSource", "qqmusic")
+    assert registry.preference("audioSource") == "qqmusic"

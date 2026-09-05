@@ -309,7 +309,9 @@ def test_search_track_merge_success():
         assert items[1]["guid"] == "online:netease:228908"
         assert items[1]["title"] == "晴天"
         assert items[1]["artist"] == "周杰伦"
-        assert items[1]["albumName"] == "叶惠美" and items[1]["album"]["name"] == "叶惠美"
+        assert items[1]["albumName"] == "叶惠美 〔网易云〕"
+        assert items[1]["album"]["name"] == "叶惠美 〔网易云〕"
+        assert items[1]["sourceName"] == "网易云"
         assert items[1]["duration_ms"] == 269000
         assert items[1]["durationMs"] == 269000
         assert items[1]["codec"] == "flac"
@@ -1452,7 +1454,7 @@ def test_favorite_track_create_online_authorized():
         track = item["track"]
         assert track["title"] == "晴天"
         assert track["artists"][0]["name"] == "周杰伦"
-        assert track["album"]["name"] == "叶惠美"
+        assert track["album"]["name"] == "叶惠美 〔酷我〕"
         assert track["isFavorite"] is True
         assert track["duration"] == 269000
         assert track["audioSpec"]["format"] == "mp3"
@@ -1647,7 +1649,7 @@ def test_favorite_track_list_merge():
         assert isinstance(online_item["artists"], list)
         assert online_item["artists"][0]["name"] == "周杰伦"
         assert isinstance(online_item["album"], dict)
-        assert online_item["album"]["name"] == "魔杰座"
+        assert online_item["album"]["name"] == "魔杰座 〔咪咕〕"
         assert isinstance(online_item["audioSpec"], dict)
         assert online_item["audioSpec"]["format"] == "flac"
         assert "createdAt" in online_item

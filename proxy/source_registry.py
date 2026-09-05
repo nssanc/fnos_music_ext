@@ -66,3 +66,20 @@ class SourceRegistry:
 
     def snapshot(self) -> dict[str, bool]:
         return {source_id: self.enabled(source_id) for source_id in self.defaults}
+
+    def preference(self, key: str, default: str = "auto") -> str:
+        with self._lock:
+            values = self._read().get("preferences", {})
+            value = values.get(key) if isinstance(values, dict) else None
+            return value if isinstance(value, str) and value else default
+
+    def set_preference(self, key: str, value: str) -> None:
+        with self._lock:
+            data = self._read()
+            values = data.get("preferences")
+            if not isinstance(values, dict):
+                values = {}
+            values[key] = value
+            data["version"] = 2
+            data["preferences"] = values
+            self._write(data)
