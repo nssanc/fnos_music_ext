@@ -579,9 +579,36 @@ EOF
 }
 
 # --- QQ Music ---
+prepare_qqmusic_source() {
+    if ! command -v git >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        log_err "启用 QQ 音乐需要宿主机提供 git 和 tar"
+        return 1
+    fi
+    local cache="${BASE_DIR}/.vendor/qqmusic-api"
+    local staging
+    mkdir -p "${BASE_DIR}/.vendor" "${BASE_DIR}/qqmusic-service"
+    if [ ! -d "${cache}/.git" ]; then
+        mkdir -p "${cache}"
+        git -C "${cache}" init -q
+        git -C "${cache}" remote add origin "${QQMUSIC_REPO}"
+    else
+        git -C "${cache}" remote set-url origin "${QQMUSIC_REPO}"
+    fi
+    log_info "宿主机拉取 QQ 音乐固定版本 ${QQMUSIC_REF}..."
+    git -C "${cache}" fetch --depth 1 origin "${QQMUSIC_REF}"
+    git -C "${cache}" checkout --detach -q FETCH_HEAD
+
+    staging="$(mktemp -d "${BASE_DIR}/qqmusic-service/vendor.tmp.XXXXXX")"
+    git -C "${cache}" archive FETCH_HEAD | tar -x -C "${staging}"
+    printf '%s\n' "${QQMUSIC_REF}" > "${staging}/.fnmusic-ref"
+    rm -rf "${BASE_DIR}/qqmusic-service/vendor"
+    mv "${staging}" "${BASE_DIR}/qqmusic-service/vendor"
+}
+
 install_qqmusic_docker() {
     log_info "构建并启动 QQ 音乐容器（固定版本 ${QQMUSIC_REF}）..."
     sudo systemctl disable --now fnmusic-qqmusic.service 2>/dev/null || true
+    prepare_qqmusic_source
     QQMUSIC_REPO="${QQMUSIC_REPO}" QQMUSIC_REF="${QQMUSIC_REF}" \
         docker_cmd compose -f "${BASE_DIR}/docker-compose.yml" up -d --build qqmusic
     if wait_http "http://127.0.0.1:8771/health" 60 2; then
@@ -600,11 +627,7 @@ install_qqmusic_host() {
     stop_docker_container fnmusic-qqmusic
     local vendor="${BASE_DIR}/.vendor/qqmusic-api"
     mkdir -p "${BASE_DIR}/.vendor" "${BASE_DIR}/qqmusic-data"
-    if [ ! -d "${vendor}/.git" ]; then
-        git clone "${QQMUSIC_REPO}" "${vendor}"
-    fi
-    git -C "${vendor}" fetch --depth 1 origin "${QQMUSIC_REF}"
-    git -C "${vendor}" checkout --detach "${QQMUSIC_REF}"
+    prepare_qqmusic_source
     sed -i 's/app\.listen(PORT, () =>/app.listen(PORT, "127.0.0.1", () =>/' "${vendor}/src/server.js"
     npm --prefix "${vendor}" pkg set dependencies.undici=6.28.1 overrides.qs=6.16.0
     npm --prefix "${vendor}" install --omit=dev --ignore-scripts

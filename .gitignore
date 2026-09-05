@@ -6,6 +6,7 @@
 .vendor/
 musicbox-data/
 qqmusic-data/
+qqmusic-service/vendor/
 lx-source-data/
 lx-source-service/data/
 cache/
