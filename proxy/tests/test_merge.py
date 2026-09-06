@@ -1149,6 +1149,36 @@ def test_third_party_client_head_probe_does_not_download_audio():
     assert calls == {"info": 1, "stream": 0}
 
 
+def test_third_party_head_probe_omits_unknown_length_instead_of_zero():
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/info":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "id": "kuwo:unknown-size",
+                    "source": "kuwo",
+                    "title": "未知大小",
+                    "artist": "测试歌手",
+                    "ext": "mp3",
+                },
+            )
+        raise AssertionError("HEAD probe must not request the audio stream")
+
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        response = client.head(
+            "/music/api/v1/track/stream?guid=online:kuwo:unknown-size"
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert "content-length" not in response.headers
+
+
 def test_online_search_track_advertises_on_demand_lyrics_to_third_party_clients():
     track = build_online_track(
         {

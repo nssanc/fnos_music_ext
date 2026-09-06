@@ -3003,7 +3003,11 @@ async def online_stream_head(request: Request, guid: str) -> Response:
         file_size = 0
     if file_size > 0:
         headers["Content-Length"] = str(file_size)
-    return Response(status_code=200, headers=headers)
+        return Response(status_code=200, headers=headers)
+    # Plain Response would synthesize ``Content-Length: 0`` for an empty HEAD
+    # body. Some media engines interpret that as a genuinely empty audio file.
+    # StreamingResponse deliberately leaves the unknown size unspecified.
+    return StreamingResponse(iter(()), status_code=200, headers=headers)
 
 
 @app.api_route("/music/api/v1/track/stream", methods=["GET", "HEAD"])
