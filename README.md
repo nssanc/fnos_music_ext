@@ -350,7 +350,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
        │
        ├─► 收藏请求 (/favorite-track/*) ► 本地曲目直传上游 / 在线曲目按用户GUID落盘 ──► 多用户隔离 + 列表倒序动态合并
        │
-       ├─► 歌词与封面 (/lyric/*, /static/cover) ──► 优先命中Sidecar歌词缓存 / 在线封面 302 CDN 重定向
+       ├─► 歌词与封面 (/lyric/*, /static/cover) ──► 优先命中Sidecar歌词缓存 / 在线封面兼容代理
        │
        └─► 歌单请求 (/playlist/*) ──► 注入虚拟「每日推荐」歌单 ──► 口味画像 + LLM候选 + 在线可用性验证
 ```
@@ -389,7 +389,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
 #### ④ 歌词与封面代理（Lyric Sidecar & Cover Redirect）
 - **歌词双级解析**（拦截 `/music/api/v1/lyric/list`、`track/lyrics`）：优先读取本地同名 `.lrc` Sidecar 缓存；未命中时异步向上游在线音源拉取 LRC 格式歌词，适配飞牛前端期望的行级载荷结构（`$n.lyric.list` / `preferred`），并自动持久化为本地 Sidecar 歌词文件。
-- **封面极速重定向**（拦截 `/music/api/v1/static/cover`）：本地封面直接透传官方 Go 后端；在线封面解析对应音源平台的高清封面 URL，并通过 HTTP `302 Found` 重定向直接引导客户端从官方源站 CDN 下载图片，零占用 NAS 本地带宽与内存。
+- **封面兼容代理**（拦截 `/music/api/v1/static/cover`）：本地封面直接透传官方 Go 后端；在线封面由 NAS 从对应音源平台读取并以图片响应返回，避免第三方 iOS/Android 客户端因 HTTP CDN 跳转、认证或锁屏图片缓存限制而显示空白。
 
 #### ⑤ 每日推荐生成（LLM + Hybrid Recommendation）
 - **接口拦截**：`playlist/list`、`playlist/detail`、`playlist/batch-detail`、`track/playlist-detail/list` 等。
@@ -475,9 +475,9 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
   - 优先读取本地 `.lrc` Sidecar 歌词缓存；未命中时按音源类型异步调取网易云、QQ 音乐或 musicdl 歌词接口，解析并格式化为飞牛前端适配的 LRC 载荷（`$n.lyric.list` / `preferred` 结构），并同步落盘至 Sidecar 缓存。
   - QQ 音乐返回的 QRC/XML、Base64 与 HTML 实体歌词会先解码并转换为标准 LRC 时间轴，使逐行高亮和自动滚动行为与网易云歌词一致；纯文本歌词会安全降级显示。
   - Sidecar 回退匹配同时校验歌曲名与歌手，避免把同名或相似文件的歌词错误套到当前歌曲。
-- **高清封面代理与重定向**：
+- **高清封面兼容代理**：
   - 拦截 `/music/api/v1/static/cover`。
-  - 支持 `guid` 或 `coverId` 参数，自动解析在线音源高清封面 URL 并通过 `302 Found` 重定向至源站 CDN 高清大图，同时兼容本地封面透传。搜索与每日推荐结果缺少封面时，会按歌曲名和歌手从 QQ 音乐、网易云等已启用来源交叉补全。
+  - 支持 `guid`、`coverId` 及客户端路径式参数，自动解析在线音源高清封面并通过 NAS 兼容代理直接返回图片，同时兼容本地封面透传。歌曲、歌手和专辑都提供非空封面标识；搜索与每日推荐结果缺少封面时，会按歌曲名和歌手从 QQ 音乐、网易云等已启用来源交叉补全。
 
 ### 5. 每日推荐（Daily Recommend）
 
@@ -508,6 +508,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ### 6. 第三方客户端、失效文件与完整音源保护
 
 - **飞牛原生 API 客户端兼容**：支持选择“飞牛音乐”作为服务器类型、通过 `/music/api/v1` 和 `music-token` 连接的手机、桌面及车机客户端。搜索结果中的在线歌曲可继续请求元数据、封面、LRC 歌词和音频流。
+- **第三方客户端最近播放**：除兼容 `/event/report` 的多种播放事件字段外，在线音频的实际 `GET` 请求也会作为播放信号；因此不发送事件上报的客户端，播放后仍会在 `/play-history/list` 和首页最近播放中出现，并保留歌曲、歌手、专辑及封面信息。
 - **播放器探测兼容**：`/track/stream` 同时支持 `GET`、`HEAD` 与字节范围请求。HEAD 只返回媒体类型、可用长度及 `Accept-Ranges`，不会误触发整首下载；大小未知时不返回错误的 `Content-Length: 0`。
 - **失效本地文件过滤**：飞牛数据库可能在文件被外部删除后暂时保留旧 Track 记录。代理会检查本地曲目的 `/volN/...` 实际路径，在搜索、曲库、收藏、歌单、歌手/专辑歌曲及最近播放等 JSON 列表中统一剔除文件已不存在的条目，并同步修正 `total`。这是只读过滤，不直接修改官方 `music.db`。
 - **30 秒试听流拦截**：播放时结合搜索结果时长、响应 URL、`Content-Length` 和 `Content-Range` 总大小判断是否为短试听。长歌曲若只拿到明显不足的音频体积，会拒绝该地址，不写入音乐库或缓存。

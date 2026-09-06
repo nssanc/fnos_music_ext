@@ -28,7 +28,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
@@ -129,6 +129,18 @@ def source_family(source_id: str) -> str:
 
 def source_label(source_id: str) -> str:
     return SOURCE_LABELS.get((source_id or "").lower(), source_id or "在线")
+
+
+def entity_cover_url(item: dict) -> str:
+    """Accept the cover field variants returned by musicbox/NetEase entities."""
+    for key in (
+        "cover_url", "coverUrl", "pic_url", "picUrl", "img1v1_url", "img1v1Url",
+        "avatar_url", "avatarUrl", "album_pic_url", "blur_pic_url", "blurPicUrl",
+    ):
+        value = str(item.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+    return ""
 
 
 def order_online_items(items: list[dict]) -> list[dict]:
@@ -491,11 +503,15 @@ def build_online_artist(item: dict) -> dict | None:
     if not raw_id or not name:
         return None
     guid = online_entity_guid("artist", raw_id)
+    cover = entity_cover_url(item)
     result = {
         "guid": guid,
         "id": guid,
         "name": name,
-        "coverId": "",
+        # Third-party clients do not derive an artist image from its tracks;
+        # a non-empty coverId is required before they call /static/cover.
+        "coverId": guid,
+        "cover_url": cover,
         "albumCount": int(item.get("album_count") or 0),
         "trackCount": int(item.get("track_count") or 0),
         "alias": str(item.get("alias") or ""),
@@ -512,6 +528,7 @@ def build_online_album(item: dict) -> dict | None:
         return None
     artist_name = str(item.get("artists_name") or item.get("artist_name") or item.get("artist") or "").strip()
     guid = online_entity_guid("album", raw_id)
+    cover = entity_cover_url(item)
     artists = []
     if artist_name:
         artists = [{"guid": online_entity_guid("artist:name", artist_name), "name": artist_name}]
@@ -520,7 +537,8 @@ def build_online_album(item: dict) -> dict | None:
         "id": guid,
         "name": name,
         "artists": artists,
-        "coverId": "",
+        "coverId": guid,
+        "cover_url": cover,
         "trackCount": int(item.get("track_count") or 0),
         "releaseYear": item.get("release_year"),
         "isOnline": True,
@@ -535,11 +553,13 @@ def build_online_playlist(item: dict) -> dict | None:
     if not raw_id or not name:
         return None
     guid = online_entity_guid("playlist", raw_id)
+    cover = entity_cover_url(item)
     result = {
         "guid": guid,
         "id": guid,
         "name": name,
-        "coverId": "",
+        "coverId": guid,
+        "cover_url": cover,
         "trackCount": int(item.get("track_count") or 0),
         "createdAt": int(item.get("created_at") or 0),
         "updatedAt": int(item.get("updated_at") or 0),
@@ -1403,6 +1423,14 @@ def get_lx_source_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+def get_cover_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    client = getattr(fastapi_app.state, "cover_client", None)
+    if client is None:
+        client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        fastapi_app.state.cover_client = client
+    return client
+
+
 def get_llm_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     client = getattr(fastapi_app.state, "llm_client", None)
     if client is None:
@@ -1827,6 +1855,7 @@ async def load_online_entity_bundle(request: Request, guid: str) -> dict | None:
         "id": guid,
         "name": name or str(prior.get("name") or "在线内容"),
         "coverId": cover_id,
+        "cover_url": entity_cover_url(prior),
         "trackCount": len(tracks),
         "tracks": tracks,
         "detail_ts": time.time(),
@@ -1848,7 +1877,7 @@ async def load_online_entity_bundle(request: Request, guid: str) -> dict | None:
                     "id": album_guid,
                     "name": album_name,
                     "artists": [{"guid": guid, "name": bundle["name"]}],
-                    "coverId": "",
+                    "coverId": online_guid_from_item(item),
                     "trackCount": 0,
                     "isOnline": True,
                 },
@@ -2128,6 +2157,7 @@ async def lifespan(fastapi_app: FastAPI):
     created_qqmusic = False
     created_lx_source = False
     created_llm = False
+    created_cover = False
 
     if getattr(fastapi_app.state, "upstream_client", None) is None:
         fastapi_app.state.upstream_client = httpx.AsyncClient(
@@ -2167,6 +2197,10 @@ async def lifespan(fastapi_app: FastAPI):
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
 
+    if getattr(fastapi_app.state, "cover_client", None) is None:
+        fastapi_app.state.cover_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+        created_cover = True
+
     try:
         yield
     finally:
@@ -2188,6 +2222,9 @@ async def lifespan(fastapi_app: FastAPI):
         if created_llm and getattr(fastapi_app.state, "llm_client", None):
             await fastapi_app.state.llm_client.aclose()
             fastapi_app.state.llm_client = None
+        if created_cover and getattr(fastapi_app.state, "cover_client", None):
+            await fastapi_app.state.cover_client.aclose()
+            fastapi_app.state.cover_client = None
 
 
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
@@ -3208,6 +3245,47 @@ async def stream_full_length_fallback(
     return None
 
 
+async def online_history_snapshot(request: Request, guid: str) -> dict:
+    """Keep enough metadata for recent-play lists after the search cache expires."""
+    info = dict(_ONLINE_ENTITY_CACHE.get(guid) or {})
+    if not str(info.get("title") or info.get("name") or "").strip():
+        resolved = await _online_info(request, guid)
+        if isinstance(resolved, dict):
+            info.update(resolved)
+    album = info.get("album")
+    if isinstance(album, dict):
+        album = info.get("originalAlbum") or album.get("name") or ""
+    return {
+        "guid": guid,
+        "id": song_id_from_online_guid(guid),
+        "source": str(info.get("source") or source_from_online_guid(guid)),
+        "title": str(info.get("title") or info.get("name") or ""),
+        "artist": str(info.get("artist") or ""),
+        "album": str(album or "").split(" 〔", 1)[0],
+        "duration_s": info.get("duration_s") or 0,
+        "ext": info.get("ext") or info.get("format") or "mp3",
+        "file_size": info.get("file_size") or info.get("size") or 0,
+        "cover_url": entity_cover_url(info),
+    }
+
+
+async def record_stream_play(request: Request, guid: str) -> None:
+    """Record native-client playback even when it never sends event/report."""
+    try:
+        is_authed, user_guid, _ = await _probe_upstream_auth(
+            request, get_upstream_client(request.app)
+        )
+        if not is_authed or not user_guid or user_guid == "shared":
+            return
+        snapshot = await online_history_snapshot(request, guid)
+        if not snapshot.get("title"):
+            return
+        async with _HISTORY_LOCK:
+            dailyrec.record_online_play(user_guid, guid, snapshot)
+    except Exception as exc:
+        logger.warning("failed to record stream play for %s: %s", guid, exc)
+
+
 async def online_stream_head(request: Request, guid: str) -> Response:
     """Return a cheap media probe for native/third-party playback engines.
 
@@ -3257,6 +3335,10 @@ async def stream_track(request: Request, subpath: str = ""):
 
     if request.method == "HEAD":
         return await online_stream_head(request, guid)
+
+    # Several native clients start playback but omit event/report. A real GET
+    # is therefore the most reliable cross-client play signal (HEAD is ignored).
+    await record_stream_play(request, guid)
 
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
@@ -3650,12 +3732,71 @@ def placeholder_cover() -> Response:
     return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
 
 
+def normalize_cover_guid(raw: str) -> str:
+    """Normalize query/path forms used by Web, Android, iOS and car clients."""
+    value = str(raw or "").strip().lstrip("/")
+    if not value.startswith("online:"):
+        return value
+    value = value.split("/", 1)[0]
+    value = re.sub(r"\.(?:jpe?g|png|webp|avif)$", "", value, flags=re.IGNORECASE)
+    return value
+
+
+async def proxy_remote_cover(request: Request, url: str) -> Response | None:
+    """Relay source artwork so native clients never depend on CDN redirects.
+
+    Some iOS image stacks reject an HTTPS NAS response that redirects to an
+    HTTP artwork URL. Relaying also keeps the authenticated NAS URL stable for
+    lock-screen artwork caches.
+    """
+    if not url.startswith(("http://", "https://")):
+        return None
+    headers = {
+        "User-Agent": "Mozilla/5.0 fnmusic-ext/1.0",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    try:
+        client = get_cover_client(request.app)
+        if request.method == "HEAD":
+            upstream = await client.head(url, headers=headers)
+            if upstream.status_code >= 400:
+                return None
+            content_type = upstream.headers.get("content-type") or "image/jpeg"
+            response_headers = {
+                "Cache-Control": "public, max-age=86400",
+                "Content-Type": content_type,
+            }
+            length = upstream.headers.get("content-length")
+            if length and length.isdigit():
+                response_headers["Content-Length"] = length
+            return Response(status_code=200, headers=response_headers)
+
+        upstream = await client.get(url, headers=headers)
+        if upstream.status_code >= 400 or not upstream.content:
+            return None
+        if len(upstream.content) > 12 * 1024 * 1024:
+            logger.warning("cover is unexpectedly large (%s bytes): %s", len(upstream.content), url)
+            return None
+        content_type = upstream.headers.get("content-type") or "image/jpeg"
+        if not content_type.lower().startswith("image/"):
+            content_type = "image/jpeg"
+        return Response(
+            content=upstream.content,
+            media_type=content_type,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    except Exception as exc:
+        logger.warning("failed to proxy online cover %s: %s", url, exc)
+        return None
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
-    if not guid and subpath.startswith("online:"):
-        guid = subpath
+    raw_guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    if not raw_guid and subpath.startswith("online:"):
+        raw_guid = subpath
+    guid = normalize_cover_guid(raw_guid)
     if dailyrec.is_daily_playlist_guid(guid):
         upstream_client = get_upstream_client(request.app)
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -3670,12 +3811,32 @@ async def static_cover(request: Request, subpath: str = ""):
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
+    parsed_entity = parse_online_entity_guid(guid)
+    if parsed_entity and parsed_entity[0] in {
+        "artist", "artist-name", "album", "album-name", "playlist"
+    }:
+        cached_entity = _ONLINE_ENTITY_CACHE.get(guid) or {}
+        cover = entity_cover_url(cached_entity)
+        bundle = None
+        if not cover:
+            bundle = await load_online_entity_bundle(request, guid)
+            cover = entity_cover_url(bundle or {})
+        if cover:
+            proxied = await proxy_remote_cover(request, cover)
+            if proxied is not None:
+                return proxied
+        entity_cover_id = str((bundle or cached_entity).get("coverId") or "")
+        if is_online_guid(entity_cover_id) and entity_cover_id != guid:
+            guid = entity_cover_id
+
     data = await _online_info(request, guid)
     cover = (data or {}).get("cover_url") or ""
     if not cover:
         cover = await resolve_fallback_cover(request, guid, data)
     if cover:
-        return RedirectResponse(cover, status_code=302)
+        proxied = await proxy_remote_cover(request, cover)
+        if proxied is not None:
+            return proxied
     return placeholder_cover()
 
 
@@ -4388,16 +4549,31 @@ async def event_report(request: Request):
     except Exception:
         body = {}
     events = body.get("events") if isinstance(body, dict) else None
+    if not isinstance(events, list) and isinstance(body, dict) and (
+        body.get("eventType") or body.get("type")
+    ):
+        events = [body]
     online_plays: list[str] = []
     other_events: list = []
     if isinstance(events, list):
         for ev in events:
             if not isinstance(ev, dict):
                 continue
-            et = str(ev.get("eventType") or ev.get("type") or "")
+            et = str(ev.get("eventType") or ev.get("type") or "").casefold()
             payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
-            guid = str(payload.get("trackGUID") or payload.get("guid") or "")
-            if et in ("track_play", "TrackPlay") and is_online_guid(guid):
+            if not payload and isinstance(ev.get("data"), dict):
+                payload = ev["data"]
+            guid = str(
+                payload.get("trackGUID")
+                or payload.get("trackGuid")
+                or payload.get("trackId")
+                or payload.get("guid")
+                or ev.get("trackGUID")
+                or ev.get("trackGuid")
+                or ev.get("guid")
+                or ""
+            )
+            if et in {"track_play", "trackplay", "track_played", "play"} and is_online_guid(guid):
                 online_plays.append(guid)
             else:
                 other_events.append(ev)
@@ -4409,21 +4585,9 @@ async def event_report(request: Request):
         if is_authed:
             async with _HISTORY_LOCK:
                 for guid in online_plays:
-                    info = stub_online_info(guid)
-                    cached = find_cache_file(guid)
-                    title = str(info.get("title") or "")
-                    artist = str(info.get("artist") or "")
-                    if cached:
-                        base = os.path.splitext(os.path.basename(cached))[0]
-                        if " - " in base:
-                            artist, title = base.split(" - ", 1)
-                        elif not title:
-                            title = base
-                    dailyrec.record_online_play(
-                        user_guid,
-                        guid,
-                        {"guid": guid, "title": title, "artist": artist, "source": source_from_online_guid(guid)},
-                    )
+                    snapshot = await online_history_snapshot(request, guid)
+                    if snapshot.get("title"):
+                        dailyrec.record_online_play(user_guid, guid, snapshot)
         elif auth_resp is not None and not other_events:
             return auth_resp
 
@@ -4449,7 +4613,8 @@ async def event_report(request: Request):
 
 
 @app.get("/music/api/v1/play-history/list")
-async def play_history_list(request: Request):
+@app.get("/music/api/v1/play-history/list/{subpath:path}")
+async def play_history_list(request: Request, subpath: str = ""):
     upstream_client = get_upstream_client(request.app)
     envelope = await fetch_upstream_envelope(request, upstream_client)
     if isinstance(envelope, Response):

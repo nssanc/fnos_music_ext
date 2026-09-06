@@ -4,6 +4,7 @@ import pytest
 import httpx
 from fastapi.testclient import TestClient
 
+from proxy import recommend as dailyrec
 from proxy.app import (
     app,
     CONF,
@@ -515,6 +516,9 @@ def test_search_artist_album_playlist_and_open_details():
         artist = client.get("/music/api/v1/search/artist?q=周杰伦&page=1&size=24").json()["data"]
         album = client.get("/music/api/v1/search/album?q=叶惠美&page=1&size=24").json()["data"]
         playlist = client.get("/music/api/v1/search/playlist?q=华语&page=1&size=24").json()["data"]
+        assert artist["list"][0]["coverId"] == artist["list"][0]["guid"]
+        assert album["list"][0]["coverId"] == album["list"][0]["guid"]
+        assert playlist["list"][0]["coverId"] == playlist["list"][0]["guid"]
         assert artist["list"][0]["guid"] == "online:netease:artist:6452"
         assert album["list"][0]["artists"][0]["name"] == "周杰伦"
         assert playlist["list"][0]["guid"] == "online:netease:playlist:88"
@@ -1193,6 +1197,41 @@ def test_third_party_client_head_probe_does_not_download_audio():
     assert response.headers["x-fnmusic-ext-source"] == "kuwo"
     assert response.content == b""
     assert calls == {"info": 1, "stream": 0}
+
+
+def test_third_party_stream_get_records_rich_recent_play(tmp_path, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "history"))
+    guid = "online:netease:third-party-history"
+    build_online_track({
+        "id": "netease:third-party-history",
+        "source": "netease",
+        "title": "最近播放测试",
+        "artist": "测试歌手",
+        "album": "测试专辑",
+        "cover_url": "https://img.example/recent.jpg",
+        "duration_s": 180,
+    })
+    cached = tmp_path / "library" / "测试歌手" / "最近播放测试.mp3"
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(b"cached-audio" * 200)
+    remember_media_path(guid, str(cached))
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/user/me":
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "native-user"}})
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    with TestClient(app) as client:
+        response = client.get("/music/api/v1/track/stream", params={"guid": guid})
+
+    assert response.status_code == 200
+    history = dailyrec.load_online_play_history("native-user")
+    assert history[-1]["guid"] == guid
+    assert history[-1]["track"]["title"] == "最近播放测试"
+    assert history[-1]["track"]["cover_url"] == "https://img.example/recent.jpg"
 
 
 def test_third_party_head_probe_omits_unknown_length_instead_of_zero():
@@ -2186,8 +2225,8 @@ def test_user_guid_sanitization():
     assert sanitize_user_guid(None) == "shared"
 
 
-def test_static_cover_online_coverid_redirect():
-    """测试 1: mock musicdl /info 返回 cover_url，GET /static/cover?coverId=online:migu:123&size=120 → 302 且 Location == cover_url。"""
+def test_static_cover_online_coverid_is_proxied_for_native_clients():
+    """Online artwork is relayed, avoiding iOS failures on HTTP CDN redirects."""
     cover_target = "http://img.music.migu.cn/cover123.jpg"
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
@@ -2213,14 +2252,20 @@ def test_static_cover_online_coverid_redirect():
     app.state.musicdl_client = httpx.AsyncClient(
         transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
     )
+    app.state.cover_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"jpeg-cover", headers={"content-type": "image/jpeg"})
+        )
+    )
 
     with TestClient(app) as client:
         resp = client.get(
             "/music/api/v1/static/cover?coverId=online:migu:123&size=120",
             follow_redirects=False,
         )
-        assert resp.status_code == 302
-        assert resp.headers.get("location") == cover_target
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/jpeg")
+        assert resp.content == b"jpeg-cover"
 
 
 def test_static_cover_falls_back_to_qqmusic(monkeypatch):
@@ -2235,10 +2280,15 @@ def test_static_cover_falls_back_to_qqmusic(monkeypatch):
 
     app.state.musicdl_client = httpx.AsyncClient(transport=httpx.MockTransport(musicdl_handler), base_url="http://musicdl")
     app.state.qqmusic_client = httpx.AsyncClient(transport=httpx.MockTransport(qq_handler), base_url="http://qqmusic")
+    app.state.cover_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"qq-cover", headers={"content-type": "image/jpeg"})
+        )
+    )
     with TestClient(app) as client:
         response = client.get("/music/api/v1/static/cover?coverId=online:migu:123", follow_redirects=False)
-    assert response.status_code == 302
-    assert response.headers["location"] == "https://y.qq.com/music/photo_new/T002R500x500M000album1.jpg"
+    assert response.status_code == 200
+    assert response.content == b"qq-cover"
 
 
 def test_static_cover_returns_svg_placeholder_when_all_sources_miss(monkeypatch):

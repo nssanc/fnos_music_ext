@@ -9,13 +9,22 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy import recommend as dailyrec
-from proxy.app import CONF, _DAILY_TASKS, _SEARCH_CACHE, app, _conf_log_value
+from proxy.app import (
+    CONF,
+    _DAILY_TASKS,
+    _ONLINE_ENTITY_CACHE,
+    _SEARCH_CACHE,
+    app,
+    build_online_track,
+    _conf_log_value,
+)
 
 
 @pytest.fixture(autouse=True)
 def setup_recommend_env(tmp_path, monkeypatch):
     _SEARCH_CACHE.clear()
     _DAILY_TASKS.clear()
+    _ONLINE_ENTITY_CACHE.clear()
     rec_dir = str(tmp_path / "recommend_cache")
     hist_dir = str(tmp_path / "play_history")
     fav_dir = str(tmp_path / "online_favorites")
@@ -274,6 +283,15 @@ def test_playlist_unauth_passthrough(monkeypatch):
 
 def test_event_report_records_online_play(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_PLAY_HISTORY_DIR", str(tmp_path / "ph"))
+    build_online_track({
+        "id": "migu:1",
+        "source": "migu",
+        "title": "在线播放测试",
+        "artist": "测试歌手",
+        "album": "测试专辑",
+        "cover_url": "https://img.example/cover.jpg",
+        "duration_s": 240,
+    })
     app.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(_auth_user()), base_url="http://unix")
     with TestClient(app) as client:
         resp = client.post(
@@ -283,6 +301,8 @@ def test_event_report_records_online_play(tmp_path, monkeypatch):
         assert resp.json()["code"] == 0
         items = dailyrec.load_online_play_history("user-rec-1")
         assert items[-1]["guid"] == "online:migu:1"
+        assert items[-1]["track"]["title"] == "在线播放测试"
+        assert items[-1]["track"]["cover_url"] == "https://img.example/cover.jpg"
 
 
 def test_play_history_merges_online(tmp_path, monkeypatch):
