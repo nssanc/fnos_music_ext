@@ -35,4 +35,7 @@ def test_extension_assets_include_mobile_layout_and_safe_areas():
     assert "#fmx-player-source" in script
     assert "fmx-mobile-nav" in script
     assert "手机导航" in script
+    assert "fmx-now-playing-open" in script
+    assert "--music-player-now-playing-player-left-width:100%" in script
+    assert "[data-lyric-index]" in script
     assert "aria-label','在线音源设置'" in script

@@ -14,6 +14,7 @@ from proxy.app import (
     _SEARCH_CACHE,
     artist_directory_name,
     build_online_track,
+    build_metadata_payload,
     find_cache_file,
     library_basename,
     normalize_timed_lyric,
@@ -1173,6 +1174,22 @@ def test_lyric_normalizer_supports_qq_qrc_html_base64_and_other_lrc_sources():
     assert normalize_timed_lyric(encoded) == "[00:01.00]晴天"
 
     assert normalize_timed_lyric("[00:02,50]咪咕\\n[00:04.000]洛雪") == "[00:02.50]咪咕\n[00:04.000]洛雪"
+
+
+def test_playback_metadata_never_exposes_raw_qrc_xml():
+    payload = build_metadata_payload(
+        "online:qq:qrc-mid",
+        {
+            "id": "qq:qrc-mid",
+            "source": "qq",
+            "title": "测试歌曲",
+            "artist": "测试歌手",
+            "lyric": '<QrcInfos><LyricInfo><Lyric_1 LyricContent="[1200,1000]你(1200,300)好"/></LyricInfo></QrcInfos>',
+        },
+    )
+    assert payload["data"]["lyrics"] == "[00:01.200]你好"
+    assert payload["data"]["track"]["lyrics"] == "[00:01.200]你好"
+    assert "QrcInfos" not in str(payload)
 
 
 def test_online_lyrics_and_metadata_musicdl_error():

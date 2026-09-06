@@ -1924,7 +1924,12 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
     info = dict(data or {})
     info.setdefault("id", song_id_from_online_guid(guid))
     info.setdefault("source", source_from_online_guid(guid))
+    lyric_text = normalize_timed_lyric(info.get("lyric") or info.get("lyrics"))
+    info["lyric"] = lyric_text
+    info["lyrics"] = lyric_text
     vo = build_online_track(info)
+    vo["lyric"] = lyric_text
+    vo["lyrics"] = lyric_text
     album_obj = vo["album"] if isinstance(vo.get("album"), dict) else {
         "name": str(vo.get("album") or ""),
         "guid": f"{guid}:album",
@@ -1943,6 +1948,8 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
         "coverUrl": vo.get("coverUrl") or "",
         "format": vo.get("format") or "mp3",
         "hasLyric": bool(vo.get("hasLyric") or info.get("lyric")),
+        "lyric": lyric_text,
+        "lyrics": lyric_text,
         "isFavorite": False,
         "isCue": False,
         "accessStatus": 0,

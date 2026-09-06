@@ -29,5 +29,13 @@
   #fmx-mobile-more{position:fixed;left:10px;right:10px;bottom:calc(64px + env(safe-area-inset-bottom));z-index:9003;display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding:12px;background:#211f2aee;border:1px solid #ffffff1d;border-radius:16px;box-shadow:0 14px 42px #000a;backdrop-filter:blur(24px)}
   #fmx-mobile-more a{min-height:46px;display:flex;align-items:center;justify-content:center;color:#fff;text-decoration:none;background:#ffffff0d;border-radius:10px;font-size:13px}
   .fmx-mobile .min-w-\[1120px\]>.pointer-events-none.absolute.inset-x-0.bottom-0{bottom:calc(58px + env(safe-area-inset-bottom))!important;padding-left:8px!important;padding-right:8px!important;padding-bottom:8px!important}
+  .fmx-now-playing-open #fmx-mobile-nav,.fmx-now-playing-open #fmx-mobile-more{display:none!important}
+  .fmx-mobile [role="dialog"][aria-modal="true"]>div.absolute.inset-0.flex.min-h-0.flex-col>div.flex.min-h-0.flex-1.overflow-hidden{padding:0 12px 8px!important}
+  .fmx-mobile [role="dialog"][aria-modal="true"] [style*="--music-player-now-playing-player-gap"]{--music-player-now-playing-player-gap:8px!important;--music-player-now-playing-player-cover-size:min(40vw,168px)!important;--music-player-now-playing-player-left-width:100%!important;--music-player-now-playing-player-right-width:100%!important;--music-player-now-playing-player-lyrics-height:100%!important;flex-direction:column!important;justify-content:flex-start!important;gap:8px!important;max-width:100%!important;overflow:hidden}
+  .fmx-mobile [role="dialog"][aria-modal="true"] [style*="--music-player-now-playing-player-gap"]>div:first-child{width:100%!important;flex:none!important;align-self:auto!important;gap:10px!important;justify-content:flex-start!important}
+  .fmx-mobile [role="dialog"][aria-modal="true"] [style*="--music-player-now-playing-player-gap"]>div:last-child{width:100%!important;min-height:180px!important;flex:1 1 0!important;align-self:auto!important;padding:0 0 6px!important}
+  .fmx-mobile [role="dialog"][aria-modal="true"] .music--now-playing-title-marquee{font-size:20px!important;line-height:26px!important;max-height:52px!important;overflow:hidden}
+  .fmx-mobile [role="dialog"][aria-modal="true"] [data-lyric-index]{min-height:42px!important;padding-left:4px!important;padding-right:8px!important;font-size:18px!important;line-height:27px!important}
+  .fmx-now-playing-open #fmx-player-source{top:72px!important;bottom:auto!important}.fmx-now-playing-open #fmx-open{display:none!important}
 }
 @media(max-width:720px) and (orientation:landscape){#fmx-open{top:12px}.fmx-panel{max-height:94dvh}}
