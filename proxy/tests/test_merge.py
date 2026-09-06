@@ -11,6 +11,7 @@ from proxy.app import (
     _COVER_CACHE,
     _ENTITY_SEARCH_CACHE,
     _ONLINE_ENTITY_CACHE,
+    _pick_playback_match,
     _pick_lyric_match,
     _SEARCH_CACHE,
     artist_directory_name,
@@ -19,11 +20,56 @@ from proxy.app import (
     find_cache_file,
     library_basename,
     normalize_timed_lyric,
+    is_probable_audio_preview,
+    prune_missing_local_tracks,
     read_lyric_cache,
     remember_media_path,
     repair_track_entity_links,
     write_audio_tags,
 )
+
+
+def test_missing_deleted_local_tracks_are_pruned_from_api_envelopes():
+    payload = {
+        "code": 0,
+        "data": {
+            "total": 3,
+            "list": [
+                {
+                    "guid": "stale-local",
+                    "title": "Shivers",
+                    "audioSpec": {"path": "/vol99/music/Ed Sheeran/Shivers.flac"},
+                },
+                {
+                    "guid": "online:qq:full-shivers",
+                    "title": "Shivers",
+                    "audioSpec": {"path": "online/qq/full-shivers.flac"},
+                },
+                {"guid": "local-without-path", "title": "Database-only metadata"},
+            ],
+        },
+    }
+
+    cleaned, removed = prune_missing_local_tracks(payload)
+
+    assert removed == 1
+    assert cleaned["data"]["total"] == 2
+    assert [item["guid"] for item in cleaned["data"]["list"]] == [
+        "online:qq:full-shivers",
+        "local-without-path",
+    ]
+
+
+def test_full_length_match_and_preview_detection():
+    items = [
+        {"title": "Shivers", "artist": "Ed Sheeran", "duration_s": 30, "id": "preview"},
+        {"title": "Shivers", "artist": "Ed Sheeran", "duration_s": 207, "id": "full"},
+    ]
+
+    assert _pick_playback_match(items, "Shivers", "Ed Sheeran", 207)["id"] == "full"
+    assert is_probable_audio_preview({"duration_s": 207}, 480_813) is True
+    assert is_probable_audio_preview({"duration_s": 207}, 4_800_000) is False
+    assert is_probable_audio_preview({"duration_s": 30}, 480_813) is False
 
 
 def test_repair_legacy_cached_track_entity_links():

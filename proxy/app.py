@@ -1043,6 +1043,57 @@ def _pick_lyric_match(items: list[dict], title: str, artist: str) -> dict | None
     return None
 
 
+def _pick_playback_match(
+    items: list[dict], title: str, artist: str, expected_duration_s: float = 0
+) -> dict | None:
+    """Pick the full-length exact match instead of a same-name preview/edit."""
+    matches = []
+    for index, item in enumerate(items):
+        if _pick_lyric_match([item], title, artist) is None:
+            continue
+        try:
+            duration = float(item.get("duration_s") or item.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        short_preview = expected_duration_s >= 90 and 0 < duration < max(
+            60, expected_duration_s * 0.55
+        )
+        duration_delta = abs(duration - expected_duration_s) if duration and expected_duration_s else 0
+        matches.append((short_preview, duration_delta, -duration, index, item))
+    if not matches:
+        return None
+    matches.sort(key=lambda row: row[:3])
+    return matches[0][4]
+
+
+def response_media_size(headers: Any) -> int:
+    content_range = str(headers.get("content-range") or "")
+    matched = re.search(r"/(\d+)\s*$", content_range)
+    if matched:
+        return int(matched.group(1))
+    value = str(headers.get("content-length") or "")
+    return int(value) if value.isdigit() else 0
+
+
+def is_probable_audio_preview(info: dict | None, media_size: int, url: str = "") -> bool:
+    """Detect common 30-second trial streams without downloading them fully."""
+    lowered_url = (url or "").casefold()
+    if any(marker in lowered_url for marker in ("preview", "trial", "audition")):
+        return True
+    try:
+        duration_s = float((info or {}).get("duration_s") or 0)
+    except (TypeError, ValueError):
+        duration_s = 0.0
+    # Tiny payloads are common in unit probes and error wrappers; a real
+    # encoded 30-second preview is normally well above 128 KiB.
+    if duration_s < 90 or media_size < 128 * 1024:
+        return False
+    # Even a low 64-kbit/s full track needs roughly 8 KB/s. Keep a small floor
+    # so a 30-second 128-kbit/s preview (~480 KB) is rejected reliably.
+    minimum_full_size = max(700_000, int(duration_s * 8_000 * 0.75))
+    return media_size < minimum_full_size
+
+
 async def fetch_preferred_lyric(request: Request, guid: str, provider: str) -> str:
     info = dict(_ONLINE_ENTITY_CACHE.get(guid) or {})
     if not info:
@@ -1261,6 +1312,56 @@ def serve_file_with_range(path: str, range_header: str | None, media_type: str) 
     )
 
 
+def _missing_local_track(item: Any) -> bool:
+    """True when a fnOS track still points at a deleted local media file."""
+    if not isinstance(item, dict) or is_online_guid(str(item.get("guid") or "")):
+        return False
+    spec = item.get("audioSpec")
+    path = str(spec.get("path") or "") if isinstance(spec, dict) else ""
+    # fnOS libraries are mounted below /volN. Restrict the filesystem probe to
+    # that namespace so URLs and synthetic paths are never treated as deleted.
+    if not re.match(r"^/vol\d+(?:/|$)", path):
+        return False
+    return not os.path.isfile(path)
+
+
+def prune_missing_local_tracks(value: Any) -> tuple[Any, int]:
+    """Remove stale fnOS track rows from arbitrary API envelopes.
+
+    The official scanner may leave a DB row visible for a while after a file is
+    deleted outside the Music UI. Filtering at the proxy keeps web and native
+    third-party clients consistent immediately, without writing to music.db.
+    """
+    removed = 0
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            if _missing_local_track(item):
+                removed += 1
+                continue
+            cleaned, child_removed = prune_missing_local_tracks(item)
+            removed += child_removed
+            result.append(cleaned)
+        return result, removed
+    if isinstance(value, dict):
+        result = dict(value)
+        for key, child in value.items():
+            cleaned, child_removed = prune_missing_local_tracks(child)
+            result[key] = cleaned
+            removed += child_removed
+            direct_removed = (
+                len(child) - len(cleaned)
+                if isinstance(child, list) and isinstance(cleaned, list)
+                else 0
+            )
+            if direct_removed and key in {"list", "items", "rows", "tracks"}:
+                total = result.get("total")
+                if isinstance(total, int):
+                    result["total"] = max(total - direct_removed, 0)
+        return result, removed
+    return value, 0
+
+
 def get_upstream_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     client = getattr(fastapi_app.state, "upstream_client", None)
     if client is None:
@@ -1344,6 +1445,19 @@ async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Re
             media_type=resp.headers.get("content-type"),
         )
 
+    if request.method == "GET" and "application/json" in content_type:
+        content = await resp.aread()
+        await resp.aclose()
+        try:
+            payload = json.loads(content)
+        except Exception:
+            payload = None
+        if isinstance(payload, (dict, list)):
+            cleaned, removed = prune_missing_local_tracks(payload)
+            if removed:
+                logger.info("filtered %d missing local track(s) from %s", removed, request.url.path)
+            return JSONResponse(content=cleaned, status_code=resp.status_code, headers=resp_headers)
+
     async def body_stream() -> AsyncGenerator[bytes, None]:
         try:
             async for chunk in resp.aiter_bytes():
@@ -1396,6 +1510,9 @@ async def fetch_upstream_envelope(request: Request, client: httpx.AsyncClient) -
             headers=resp_headers,
             media_type=resp.headers.get("content-type"),
         )
+    payload, removed = prune_missing_local_tracks(payload)
+    if removed:
+        logger.info("filtered %d missing local track(s) from %s", removed, request.url.path)
     payload["_ext_headers"] = resp_headers
     return payload
 
@@ -2487,6 +2604,10 @@ async def search_track(request: Request):
     if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
+    upstream_json, removed = prune_missing_local_tracks(upstream_json)
+    if removed:
+        logger.info("filtered %d missing local track(s) from search", removed)
+
     if not keyword:
         return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
@@ -2942,6 +3063,7 @@ async def stream_direct_online(
     range_header: str | None,
     info: dict | None,
     resolved_ext: str | None = None,
+    allow_full_fallback: bool = True,
 ) -> Response:
     req_headers = {"Range": range_header} if range_header else {}
     stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
@@ -2959,6 +3081,24 @@ async def stream_direct_online(
             content={"code": 404, "msg": "online source unavailable", "data": None},
             status_code=404,
         )
+    media_size = response_media_size(response.headers)
+    if is_probable_audio_preview(info, media_size, play_url):
+        logger.warning(
+            "Rejected probable preview stream for %s: expected=%ss bytes=%s",
+            guid,
+            (info or {}).get("duration_s"),
+            media_size,
+        )
+        await response.aclose()
+        await stream_client.aclose()
+        if allow_full_fallback:
+            fallback = await stream_full_length_fallback(request, guid, info or {}, range_header)
+            if fallback is not None:
+                return fallback
+        return JSONResponse(
+            content={"code": 409, "msg": "only a short preview was available", "data": None},
+            status_code=409,
+        )
     return stream_tee_response(
         response,
         guid=guid,
@@ -2968,6 +3108,104 @@ async def stream_direct_online(
         resolved_ext=resolved_ext,
         pre_info=info,
     )
+
+
+async def stream_full_length_fallback(
+    request: Request, original_guid: str, original_info: dict, range_header: str | None
+) -> Response | None:
+    """Try matching providers until one yields a plausibly complete stream."""
+    title = str(original_info.get("title") or original_info.get("name") or "").strip()
+    artist = str(original_info.get("artist") or "").strip()
+    if not title:
+        return None
+    try:
+        expected_duration = float(original_info.get("duration_s") or 0)
+    except (TypeError, ValueError):
+        expected_duration = 0.0
+    keyword = " ".join(part for part in (title, artist) if part)
+    current_family = source_family(source_from_online_guid(original_guid))
+    preferred = SOURCE_REGISTRY.preference("audioSource")
+    providers = ["netease", "qqmusic", "musicdl"]
+    if preferred != "auto" and preferred in providers:
+        providers.remove(preferred)
+        providers.insert(0, preferred)
+
+    for provider in providers:
+        if provider == current_family or not source_enabled(provider):
+            continue
+        try:
+            tracks = await search_source_tracks(request, provider, keyword, 15)
+            match = _pick_playback_match(tracks, title, artist, expected_duration)
+            if not match:
+                continue
+            candidate_guid = online_guid_from_item(match)
+            try:
+                candidate_duration = float(match.get("duration_s") or 0)
+            except (TypeError, ValueError):
+                candidate_duration = 0.0
+            if expected_duration >= 90 and 0 < candidate_duration < expected_duration * 0.7:
+                continue
+            _set_online_entity_cache(candidate_guid, {**match, "ts": time.time()})
+
+            if provider == "qqmusic":
+                song_mid = song_id_from_online_guid(candidate_guid).split(":")[-1]
+                url, ext, declared_size = await resolve_qq_url(
+                    get_qqmusic_client(request.app), song_mid
+                )
+                if not url or is_probable_audio_preview(match, declared_size, url):
+                    continue
+                return await stream_direct_online(
+                    request,
+                    original_guid,
+                    url,
+                    range_header,
+                    match,
+                    ext,
+                    allow_full_fallback=False,
+                )
+
+            if provider == "netease":
+                song_id = song_id_from_online_guid(candidate_guid).split(":")[-1]
+                url = await resolve_netease_url(get_musicbox_client(request.app), song_id)
+                if not url:
+                    continue
+                return await stream_direct_online(
+                    request,
+                    original_guid,
+                    url,
+                    range_header,
+                    match,
+                    str(match.get("ext") or "mp3"),
+                    allow_full_fallback=False,
+                )
+
+            req_headers = {"Range": range_header} if range_header else {}
+            response = await get_musicdl_client(request.app).send(
+                get_musicdl_client(request.app).build_request(
+                    "GET",
+                    "/stream",
+                    params={"id": song_id_from_online_guid(candidate_guid), "proxy": "true"},
+                    headers=req_headers,
+                ),
+                stream=True,
+            )
+            if response.status_code >= 400 or is_probable_audio_preview(
+                match, response_media_size(response.headers), str(response.url)
+            ):
+                await response.aclose()
+                continue
+            return stream_tee_response(
+                response,
+                guid=original_guid,
+                range_header=range_header,
+                coro_factory=None,
+                client_to_close=None,
+                resolved_ext=str(match.get("ext") or "mp3"),
+                pre_info=match,
+            )
+        except Exception as exc:
+            logger.warning("full stream fallback %s failed for %s: %s", provider, original_guid, exc)
+    return None
 
 
 async def online_stream_head(request: Request, guid: str) -> Response:
@@ -3114,12 +3352,24 @@ async def stream_track(request: Request, subpath: str = ""):
             status_code=404,
         )
 
+    info = cached_info or await _online_info(request, guid) or {}
+    if is_probable_audio_preview(info, response_media_size(resp.headers), str(resp.url)):
+        await resp.aclose()
+        fallback = await stream_full_length_fallback(request, guid, info, range_header)
+        if fallback is not None:
+            return fallback
+        return JSONResponse(
+            content={"code": 409, "msg": "only a short preview was available", "data": None},
+            status_code=409,
+        )
+
     return stream_tee_response(
         resp,
         guid=guid,
         range_header=range_header,
         coro_factory=lambda: cache_lyrics_from_musicdl(musicdl_client, guid),
         client_to_close=None,
+        pre_info=info,
     )
 
 
