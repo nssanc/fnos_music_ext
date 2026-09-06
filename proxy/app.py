@@ -1021,12 +1021,23 @@ async def cache_lyrics_from_musicdl(musicdl_client: httpx.AsyncClient, guid: str
 def _pick_lyric_match(items: list[dict], title: str, artist: str) -> dict | None:
     wanted_title = title.strip().casefold()
     wanted_artist = artist.strip().casefold()
+    compact = lambda value: re.sub(r"[^\w\u4e00-\u9fff]+", "", value.casefold())
+    wanted_title_compact = compact(wanted_title)
+    wanted_artist_compact = compact(wanted_artist)
     for item in items:
         item_title = str(item.get("title") or item.get("name") or "").strip().casefold()
         item_artist = str(item.get("artist") or "").strip().casefold()
-        if item_title == wanted_title and (not wanted_artist or wanted_artist in item_artist or item_artist in wanted_artist):
+        title_matches = item_title == wanted_title or (
+            bool(wanted_title_compact) and compact(item_title) == wanted_title_compact
+        )
+        item_artist_compact = compact(item_artist)
+        artist_matches = not wanted_artist_compact or (
+            wanted_artist_compact in item_artist_compact
+            or item_artist_compact in wanted_artist_compact
+        )
+        if title_matches and artist_matches:
             return item
-    return items[0] if items else None
+    return None
 
 
 async def fetch_preferred_lyric(request: Request, guid: str, provider: str) -> str:
@@ -1037,6 +1048,13 @@ async def fetch_preferred_lyric(request: Request, guid: str, provider: str) -> s
     artist = str(info.get("artist") or "").strip()
     if not title:
         return ""
+    if source_family(source_from_online_guid(guid)) == provider:
+        direct_info = await _online_info(request, guid) or {}
+        direct_text = normalize_timed_lyric(
+            direct_info.get("lyric") or direct_info.get("lyrics")
+        )
+        if direct_text:
+            return direct_text
     keyword = " ".join(part for part in (title, artist) if part)
 
     try:
@@ -3267,16 +3285,18 @@ async def track_metadata(request: Request, subpath: str = ""):
             title=str(data.get("title") or ""),
             artist=str(data.get("artist") or ""),
         )
+    source_lyric = normalize_timed_lyric(data.get("lyric") or data.get("lyrics"))
     cached_lyric = read_lyric_cache(guid)
-    if cached_lyric:
-        data = {**data, "lyric": cached_lyric}
-    elif data.get("lyric"):
+    if source_lyric:
+        data = {**data, "lyric": source_lyric, "lyrics": source_lyric}
         write_lyric_cache(
             guid,
-            str(data.get("lyric") or ""),
+            source_lyric,
             title=str(data.get("title") or ""),
             artist=str(data.get("artist") or ""),
         )
+    elif cached_lyric:
+        data = {**data, "lyric": cached_lyric, "lyrics": cached_lyric}
     return JSONResponse(content=build_metadata_payload(guid, data))
 
 

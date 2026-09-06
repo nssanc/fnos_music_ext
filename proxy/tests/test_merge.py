@@ -11,6 +11,7 @@ from proxy.app import (
     _COVER_CACHE,
     _ENTITY_SEARCH_CACHE,
     _ONLINE_ENTITY_CACHE,
+    _pick_lyric_match,
     _SEARCH_CACHE,
     artist_directory_name,
     build_online_track,
@@ -18,6 +19,7 @@ from proxy.app import (
     find_cache_file,
     library_basename,
     normalize_timed_lyric,
+    read_lyric_cache,
     remember_media_path,
     repair_track_entity_links,
     write_audio_tags,
@@ -1190,6 +1192,34 @@ def test_playback_metadata_never_exposes_raw_qrc_xml():
     assert payload["data"]["lyrics"] == "[00:01.200]你好"
     assert payload["data"]["track"]["lyrics"] == "[00:01.200]你好"
     assert "QrcInfos" not in str(payload)
+
+
+def test_lyric_match_never_falls_back_to_an_unrelated_first_result():
+    items = [{"title": "Colombia", "artist": "Ryan Castro"}]
+    assert _pick_lyric_match(items, "我对缘分小心翼翼", "林俊杰") is None
+
+
+def test_track_metadata_replaces_stale_cached_lyric_with_direct_qq_lyric():
+    os.makedirs(CONF["cache_dir"], exist_ok=True)
+    cache_file = os.path.join(CONF["cache_dir"], "online_qq_target-mid.lrc")
+    with open(cache_file, "w", encoding="utf-8") as stream:
+        stream.write("[00:04.00]Colombia Gang\n")
+
+    def qq_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/song/detail":
+            return httpx.Response(200, json={"code": 0, "data": {"item_song": [{"mid": "target-mid", "name": "我对缘分小心翼翼", "singer": [{"name": "林俊杰"}], "album": {"name": "逐玉", "mid": "album-mid"}}]}})
+        if request.url.path == "/song/lyric":
+            return httpx.Response(200, json={"code": 0, "data": {"lyric": '<QrcInfos><LyricInfo><Lyric_1 LyricContent="[1000,800]正确(1000,400)歌词"/></LyricInfo></QrcInfos>'}})
+        return httpx.Response(404)
+
+    app.state.qqmusic_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(qq_handler), base_url="http://qqmusic"
+    )
+    with TestClient(app) as client:
+        response = client.get("/music/api/v1/track/metadata?guid=online:qq:target-mid")
+    assert response.status_code == 200
+    assert response.json()["data"]["lyrics"] == "[00:01.000]正确歌词"
+    assert read_lyric_cache("online:qq:target-mid") == "[00:01.000]正确歌词"
 
 
 def test_online_lyrics_and_metadata_musicdl_error():
