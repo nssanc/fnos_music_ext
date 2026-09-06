@@ -28,6 +28,11 @@ def test_extension_assets_include_mobile_layout_and_safe_areas():
         assert "@media(max-width:720px)" in content
         assert "safe-area-inset-bottom" in content
         assert "100dvh" in content
+        assert "grid-template-columns:repeat(2" in content
+    assert ".min-w-\\[1120px\\]" in css
+    assert ".min-w-\\\\[1120px\\\\]" in script
     assert "font-size:16px" in script  # Prevent iOS form zoom.
     assert "#fmx-player-source" in script
+    assert "fmx-mobile-nav" in script
+    assert "手机导航" in script
     assert "aria-label','在线音源设置'" in script
