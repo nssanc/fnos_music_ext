@@ -1100,6 +1100,73 @@ def test_stream_non_online_guid_passthrough():
         assert resp.headers.get("content-range") == "bytes 0-100/5000"
 
 
+def test_third_party_client_head_probe_does_not_download_audio():
+    """Third-party players probe media with HEAD before issuing a range GET."""
+    calls = {"info": 0, "stream": 0}
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    def musicdl_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/info":
+            calls["info"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "id": "kuwo:third-party",
+                    "source": "kuwo",
+                    "title": "第三方播放测试",
+                    "artist": "测试歌手",
+                    "ext": "flac",
+                    "file_size": 987654,
+                },
+            )
+        if request.url.path == "/stream":
+            calls["stream"] += 1
+            return httpx.Response(500)
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.musicdl_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(musicdl_handler), base_url="http://127.0.0.1:8768"
+    )
+
+    with TestClient(app) as client:
+        response = client.head(
+            "/music/api/v1/track/stream/online:kuwo:third-party",
+            headers={"Cookie": "music-token=third-party-test"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-type"] == "audio/flac"
+    assert response.headers["content-length"] == "987654"
+    assert response.headers["x-fnmusic-ext-source"] == "kuwo"
+    assert response.content == b""
+    assert calls == {"info": 1, "stream": 0}
+
+
+def test_online_search_track_advertises_on_demand_lyrics_to_third_party_clients():
+    track = build_online_track(
+        {
+            "id": "qq:003thirdparty",
+            "source": "qq",
+            "title": "第三方歌词测试",
+            "artist": "测试歌手",
+            "album": "测试专辑",
+            # Search providers intentionally omit the expensive lyric body.
+        }
+    )
+
+    assert track["hasLyric"] is True
+    assert track["guid"] == "online:qq:003thirdparty"
+    assert track["coverId"] == track["guid"]
+    assert track["audioSpec"]["path"].endswith(".mp3")
+
+
 def test_online_lyrics_and_metadata():
     """在线歌词与元数据合成。"""
     def upstream_handler(request: httpx.Request) -> httpx.Response:

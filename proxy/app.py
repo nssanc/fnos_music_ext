@@ -407,7 +407,10 @@ def build_online_track(item: dict) -> dict:
         "is_online": True,
         "isFavorite": False,
         "isCue": False,
-        "hasLyric": bool(item.get("lyric")),
+        # Third-party fnOS clients use this flag to decide whether the lyric
+        # endpoint is worth querying. Search APIs normally do not include the
+        # lyric body, although every online source can resolve it on demand.
+        "hasLyric": True,
         "genres": [],
         "accessStatus": 0,
         "createdAt": created_at,
@@ -1965,7 +1968,7 @@ def build_metadata_payload(guid: str, data: dict | None) -> dict:
         "coverId": guid,
         "coverUrl": vo.get("coverUrl") or "",
         "format": vo.get("format") or "mp3",
-        "hasLyric": bool(vo.get("hasLyric") or info.get("lyric")),
+        "hasLyric": True,
         "lyric": lyric_text,
         "lyrics": lyric_text,
         "isFavorite": False,
@@ -2967,12 +2970,51 @@ async def stream_direct_online(
     )
 
 
-@app.get("/music/api/v1/track/stream")
-@app.get("/music/api/v1/track/stream/{subpath:path}")
-async def stream_track(request: Request):
-    guid = extract_guid(request)
+async def online_stream_head(request: Request, guid: str) -> Response:
+    """Return a cheap media probe for native/third-party playback engines.
+
+    ExoPlayer, mpv and several fnOS clients issue HEAD before their first range
+    GET.  Do not turn that probe into a full upstream download/cache operation.
+    """
+    cached = find_cache_file(guid)
+    if cached:
+        cached = promote_cache_hit(guid, cached)
+        ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
+        return Response(
+            status_code=200,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(os.path.getsize(cached)),
+                "Content-Type": media_type_for_ext(ext),
+                "X-FnMusic-Ext-Source": source_from_online_guid(guid),
+            },
+        )
+
+    info = await _online_info(request, guid) or _ONLINE_ENTITY_CACHE.get(guid) or {}
+    ext = str(info.get("ext") or info.get("format") or "mp3").lower()
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": media_type_for_ext(ext),
+        "X-FnMusic-Ext-Source": source_from_online_guid(guid),
+    }
+    try:
+        file_size = int(info.get("file_size") or info.get("size") or 0)
+    except (TypeError, ValueError):
+        file_size = 0
+    if file_size > 0:
+        headers["Content-Length"] = str(file_size)
+    return Response(status_code=200, headers=headers)
+
+
+@app.api_route("/music/api/v1/track/stream", methods=["GET", "HEAD"])
+@app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
+async def stream_track(request: Request, subpath: str = ""):
+    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    if request.method == "HEAD":
+        return await online_stream_head(request, guid)
 
     range_header = request.headers.get("range")
     cached = find_cache_file(guid)
