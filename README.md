@@ -1,6 +1,6 @@
 # fnmusic-ext 飞牛音乐扩展代理
 
-`fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）量身定制的无侵入式扩展代理。通过 Unix Domain Socket 接管官方后端入口，为飞牛原生客户端无缝提供全网在线聚合搜索、流式播放、歌词与封面解析、边播边落盘，以及基于大模型的每日推荐歌单。
+`fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）量身定制的无侵入式扩展代理。通过 Unix Domain Socket 接管官方后端入口，为飞牛 Web 端及使用飞牛原生 API 的第三方客户端无缝提供全网在线聚合搜索、流式播放、歌词与封面解析、边播边落盘，以及基于大模型的每日推荐歌单。
 
 可选音源支持：[musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等）、[musicbox](https://github.com/darknessomi/musicbox)（网易云高品质）、QQ 音乐扫码登录与会员音质，以及兼容[洛雪自定义源脚本](https://lxmusic.toside.cn/desktop/custom-source)的播放地址兜底。本项目不修改飞牛官方 nginx 配置、不 Patch 官方二进制、不改动官方数据库。
 
@@ -28,6 +28,7 @@
   - [3. 本地与在线歌曲收藏合并（多用户隔离）](#3-本地与在线歌曲收藏合并多用户隔离)
   - [4. 歌词与封面代理转发与智能缓存](#4-歌词与封面代理转发与智能缓存)
   - [5. 每日推荐（Daily Recommend）](#5-每日推荐daily-recommend)
+  - [6. 第三方客户端、失效文件与完整音源保护](#6-第三方客户端失效文件与完整音源保护)
 - [目录结构](#目录结构)
 - [环境变量配置](#环境变量配置)
 - [安装配置快速指引](#安装配置快速指引)
@@ -88,7 +89,7 @@
 
 ```bash
 # 1. 拉取仓库代码
-git clone https://github.com/javycoder/fnos_music_ext.git fnmusic_ext
+git clone https://github.com/nssanc/fnos_music_ext.git fnmusic_ext
 
 # 2. 进入项目根目录
 cd fnmusic_ext
@@ -191,7 +192,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 
 ### 【步骤 4：验证与听歌】
 
-扩展生效后，飞牛音乐已静默升级完毕，客户端（Web 网页端、手机 App、电脑客户端）**无需安装任何额外插件**，直接体验在线曲库：
+扩展生效后，飞牛音乐已静默升级完毕，客户端（Web 网页端及使用飞牛原生 `/music/api/v1` 的第三方客户端）**无需安装任何额外插件**，直接体验在线曲库：
 
 1. **在线搜索与即点即播**：
    - 打开浏览器登录飞牛私有云（fnOS），进入【飞牛音乐】应用（或打开手机【飞牛音乐 App】）；
@@ -214,6 +215,10 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
    - 洛雪源脚本可能执行网络请求。运行器被隔离在独立容器和数据卷中，但仍应只导入可信来源。
 5. **每日推荐歌单（若配置了大模型）**：
    - 登录飞牛音乐后，在左侧导航栏「歌单」列表最顶部会自动出现名为「每日推荐」的专属歌单，每天准时换新 20 首推荐曲目。
+6. **第三方客户端使用**：
+   - 在第三方客户端中选择“飞牛音乐”连接类型，照常填写 NAS 地址并使用飞牛音乐账号登录；
+   - 在线搜索、封面、歌词、元数据、HEAD 探测和 Range 分段播放均复用飞牛原生接口与 `music-token` 登录状态；
+   - 若客户端曾缓存旧曲库，升级后完全退出并重新打开或执行一次“刷新曲库”即可。
 
 ---
 
@@ -493,6 +498,16 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 - 流程：LLM 出 30 首 → musicdl / musicbox 在线搜索能播的 → 去重并排除收藏 → 凑满 20 首。
 - 契约：拦截 `playlist/list`、`playlist/detail`、`playlist/batch-detail`、`track/playlist-detail/list`。未登录仍透传 `INVALID TOKEN`。
 - 密钥：只存在 `.env`（`chmod 600`）。不填则跳过 LLM，仍按歌手做在线检索凑歌单。
+
+### 6. 第三方客户端、失效文件与完整音源保护
+
+- **飞牛原生 API 客户端兼容**：支持选择“飞牛音乐”作为服务器类型、通过 `/music/api/v1` 和 `music-token` 连接的手机、桌面及车机客户端。搜索结果中的在线歌曲可继续请求元数据、封面、LRC 歌词和音频流。
+- **播放器探测兼容**：`/track/stream` 同时支持 `GET`、`HEAD` 与字节范围请求。HEAD 只返回媒体类型、可用长度及 `Accept-Ranges`，不会误触发整首下载；大小未知时不返回错误的 `Content-Length: 0`。
+- **失效本地文件过滤**：飞牛数据库可能在文件被外部删除后暂时保留旧 Track 记录。代理会检查本地曲目的 `/volN/...` 实际路径，在搜索、曲库、收藏、歌单、歌手/专辑歌曲及最近播放等 JSON 列表中统一剔除文件已不存在的条目，并同步修正 `total`。这是只读过滤，不直接修改官方 `music.db`。
+- **30 秒试听流拦截**：播放时结合搜索结果时长、响应 URL、`Content-Length` 和 `Content-Range` 总大小判断是否为短试听。长歌曲若只拿到明显不足的音频体积，会拒绝该地址，不写入音乐库或缓存。
+- **完整歌曲自动换源**：试听流被拒绝后，自动在已启用的网易云、QQ 音乐及 musicdl 音源中按“歌曲名 + 歌手 + 接近原曲时长”重新匹配，优先返回可验证的完整流；所有来源都只有试听时返回明确错误，避免客户端播放或缓存残缺文件。
+
+> 第三方客户端如果已经缓存了旧曲库列表，请执行一次“刷新曲库”，或完全退出后重新打开。通用 Subsonic/OpenSubsonic 客户端不属于飞牛原生 API 客户端，需要额外的协议桥接服务。
 
 人工安装见 [docs/INSTALL.md](docs/INSTALL.md)，Agent 安装提示词见 [docs/AGENT_INSTALL.md](docs/AGENT_INSTALL.md)。
 
