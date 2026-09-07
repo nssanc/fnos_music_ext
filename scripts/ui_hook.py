@@ -10,7 +10,7 @@ from pathlib import Path
 
 START = "<!-- fnmusic-ext-ui:start -->"
 END = "<!-- fnmusic-ext-ui:end -->"
-TAG = f'{START}<link rel="stylesheet" href="/music/api/v1/_ext/assets/settings.css"><script defer src="/music/api/v1/_ext/assets/settings.js"></script>{END}'
+TAG = f'{START}<link rel="stylesheet" href="/music/api/v1/_ext/assets/settings.css"><script src="/music/api/v1/_ext/assets/settings.js"></script>{END}'
 DEFAULT_ROOTS = (
     Path("/usr/local/apps/trim.music"),
     Path("/usr/local/apps/@appcenter/trim.music"),
@@ -74,10 +74,23 @@ def replace_atomic(path: Path, text: str) -> None:
 
 def install(path: Path) -> bool:
     text = path.read_text(encoding="utf-8")
-    if START in text:
+    existing_start = text.find(START)
+    existing_end = text.find(END, existing_start + len(START)) if existing_start >= 0 else -1
+    if existing_start >= 0 and existing_end >= 0:
+        text = text[:existing_start] + text[existing_end + len(END):]
+    lower = text.lower()
+    # Load before the Music module so new Audio() can be observed even when its
+    # element is deliberately kept outside the document tree.
+    position = lower.find('<script type="module"')
+    if position < 0:
+        position = lower.find("<script")
+    if position < 0:
+        position = lower.rfind("</head>")
+    if position < 0:
+        position = lower.rfind("</body>")
+    updated = text[:position] + TAG + text[position:] if position >= 0 else TAG + text
+    if updated == path.read_text(encoding="utf-8"):
         return False
-    position = text.lower().rfind("</body>")
-    updated = text[:position] + TAG + text[position:] if position >= 0 else text + TAG
     replace_atomic(path, updated)
     return True
 

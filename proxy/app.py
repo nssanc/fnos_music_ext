@@ -1552,10 +1552,16 @@ async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Re
         await resp.aclose()
         marker = b"/music/api/v1/_ext/assets/settings.js"
         if marker not in content:
-            tag = b'<link rel="stylesheet" href="/music/api/v1/_ext/assets/settings.css"><script defer src="/music/api/v1/_ext/assets/settings.js"></script>'
+            tag = b'<link rel="stylesheet" href="/music/api/v1/_ext/assets/settings.css"><script src="/music/api/v1/_ext/assets/settings.js"></script>'
             lower = content.lower()
-            position = lower.rfind(b"</body>")
-            content = content[:position] + tag + content[position:] if position >= 0 else content + tag
+            position = lower.find(b'<script type="module"')
+            if position < 0:
+                position = lower.find(b"<script")
+            if position < 0:
+                position = lower.rfind(b"</head>")
+            if position < 0:
+                position = lower.rfind(b"</body>")
+            content = content[:position] + tag + content[position:] if position >= 0 else tag + content
         return Response(
             content=content,
             status_code=resp.status_code,

@@ -38,6 +38,29 @@
   let switchedTrack = null;
   let lastObservedGuid = '';
   let lastMediaElement = null;
+  const trackedMediaElements = new Set();
+
+  function rememberMedia(element) {
+    if (!(element instanceof HTMLMediaElement)) return element;
+    trackedMediaElements.add(element);
+    lastMediaElement = element;
+    rememberTrackUrl(element.currentSrc || element.src || '');
+    return element;
+  }
+
+  // 飞牛的原生播放器用 `new Audio()` 创建脱离 DOM 的媒体元素。脚本必须在主程序
+  // 之前挂钩，并同时拦截 play/load，才能在 iOS/Safari 等环境可靠取得播放器实例。
+  const nativeMediaPlay = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function(...args) { rememberMedia(this); return nativeMediaPlay.apply(this, args); };
+  const nativeMediaLoad = HTMLMediaElement.prototype.load;
+  HTMLMediaElement.prototype.load = function(...args) { rememberMedia(this); return nativeMediaLoad.apply(this, args); };
+  const NativeAudio = window.Audio;
+  if (NativeAudio) {
+    function TrackedAudio(...args) { return rememberMedia(new NativeAudio(...args)); }
+    Object.setPrototypeOf(TrackedAudio, NativeAudio);
+    TrackedAudio.prototype = NativeAudio.prototype;
+    window.Audio = TrackedAudio;
+  }
 
   function shell() {
     const root = document.createElement('div'); root.id = 'fmx-overlay';
@@ -84,9 +107,20 @@
     if (document.querySelector('#fmx-open')) return;
     const button=document.createElement('button');button.id='fmx-open';button.textContent='在线音源';button.title='在线音源设置';button.setAttribute('aria-label','在线音源设置');button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();const track=currentTrack();if(track.guid)openSourceMenu();else shell();});document.body.appendChild(button);
   }
+  function mediaElements(root=document) {
+    const items=[...trackedMediaElements];
+    const visit=node=>{
+      node.querySelectorAll?.('audio,video').forEach(element=>{if(!items.includes(element))items.push(element);});
+      node.querySelectorAll?.('*').forEach(element=>{if(element.shadowRoot)visit(element.shadowRoot);});
+    };
+    visit(root);
+    return items;
+  }
   function activeAudio() {
-    const items=[...document.querySelectorAll('audio')];
-    return items.find(el => /\/music\/api\/v1\/track\/(?:stream|hls)/.test(el.currentSrc || el.src || '')) || lastMediaElement || items[0] || null;
+    const items=mediaElements();
+    const playing=items.find(el=>!el.paused&&!el.ended);
+    const streaming=items.find(el => /\/music\/api\/v1\/track\/(?:stream|hls)/.test(el.currentSrc || el.src || ''));
+    return playing || streaming || lastMediaElement || items[0] || null;
   }
   function guidFromUrl(value) {
     try {
@@ -99,7 +133,7 @@
   function rememberTrackUrl(value) { const guid=guidFromUrl(typeof value==='string'?value:value?.url||''); if(guid)lastObservedGuid=guid; }
   const nativeFetch=window.fetch.bind(window);window.fetch=(input,init)=>{rememberTrackUrl(input);return nativeFetch(input,init);};
   const nativeXhrOpen=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url,...rest){rememberTrackUrl(url);return nativeXhrOpen.call(this,method,url,...rest);};
-  document.addEventListener('play',event=>{if(event.target instanceof HTMLMediaElement){lastMediaElement=event.target;rememberTrackUrl(event.target.currentSrc||event.target.src);updatePlayerSource();}},true);
+  document.addEventListener('play',event=>{if(event.target instanceof HTMLMediaElement){rememberMedia(event.target);updatePlayerSource();}},true);
   function currentTrack() {
     const audio=activeAudio();
     let guid=guidFromUrl(audio?.currentSrc || audio?.src || '');
@@ -131,7 +165,7 @@
   }
   async function switchPlayingSource(source, button) {
     const current=currentTrack(), audio=current.audio;
-    if(!audio) { button.disabled=false;button.textContent='未找到播放器，请重新播放后再试';return; }
+    if(!audio) { button.disabled=false;button.textContent='尚未捕获播放器，请刷新页面后播放再试';return; }
     button.disabled=true; button.textContent='正在匹配并切换…';
     try {
       const result=await api('/resolve-track-source',{method:'POST',body:JSON.stringify({guid:current.guid,title:current.title,artist:current.artist,source})});
@@ -174,6 +208,9 @@
     nav.querySelectorAll('[data-fmx-path]').forEach(link=>{const target=link.dataset.fmxPath.replace(/\/+$/,'');link.classList.toggle('fmx-active',target==='/music'?path==='/music':path.startsWith(target));});
   }
   document.addEventListener('click',event=>{ if(!event.target.closest('#fmx-player-source,#fmx-source-menu')) closeSourceMenu();if(!event.target.closest('#fmx-mobile-more,[data-fmx-more]')) closeMobileMore(); });
-  if (window.__FNMUSIC_EXT_STANDALONE__) { const mount=document.querySelector('#fnmusic-ext-standalone'); const root=shell(); root.style.position='relative'; root.style.minHeight='100vh'; root.style.background='transparent'; mount.replaceWith(root); }
-  else { addButton(); updatePlayerSource(); updateMobileNav(); setInterval(()=>{updatePlayerSource();updateMobileNav();},1000);window.addEventListener('resize',updateMobileNav,{passive:true});new MutationObserver(()=>{addButton();updateMobileNav();}).observe(document.documentElement,{childList:true,subtree:true}); }
+  function boot() {
+    if (window.__FNMUSIC_EXT_STANDALONE__) { const mount=document.querySelector('#fnmusic-ext-standalone'); const root=shell(); root.style.position='relative'; root.style.minHeight='100vh'; root.style.background='transparent'; mount.replaceWith(root); }
+    else { addButton(); updatePlayerSource(); updateMobileNav(); setInterval(()=>{updatePlayerSource();updateMobileNav();},1000);window.addEventListener('resize',updateMobileNav,{passive:true});new MutationObserver(()=>{addButton();updateMobileNav();}).observe(document.documentElement,{childList:true,subtree:true}); }
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot,{once:true}); else boot();
 })();

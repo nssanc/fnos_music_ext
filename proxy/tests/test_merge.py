@@ -221,7 +221,7 @@ def test_write_audio_tags_id3(tmp_path):
 
 def test_html_passthrough_injects_settings_entry_once():
     def upstream_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="<html><body><main>music</main></body></html>", headers={"content-type": "text/html; charset=utf-8"})
+        return httpx.Response(200, text='<html><head><script type="module" src="main.js"></script></head><body><main>music</main></body></html>', headers={"content-type": "text/html; charset=utf-8"})
 
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
@@ -230,6 +230,7 @@ def test_html_passthrough_injects_settings_entry_once():
         response = client.get("/music/")
         assert response.status_code == 200
         assert response.text.count("/music/api/v1/_ext/assets/settings.js") == 1
+        assert response.text.index("/music/api/v1/_ext/assets/settings.js") < response.text.index('<script type="module"')
 
 
 def test_ext_source_settings_are_authenticated_and_persist_toggle(tmp_path):

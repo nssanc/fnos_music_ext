@@ -14,6 +14,7 @@ def test_ui_hook_is_idempotent_and_reversible(tmp_path):
     assert install(index) is False
     assert index.read_text(encoding="utf-8").count(START) == 1
     assert END in index.read_text(encoding="utf-8")
+    assert index.read_text(encoding="utf-8").index(START) < index.read_text(encoding="utf-8").index('<script src="main.js"')
     assert remove(index) is True
     assert remove(index) is False
     assert index.read_text(encoding="utf-8") == original
@@ -40,6 +41,10 @@ def test_extension_assets_include_mobile_layout_and_safe_areas():
     assert "[data-lyric-index]" in script
     assert "aria-label','在线音源设置'" in script
     assert "lastObservedGuid" in script
+    assert "new NativeAudio" in script
+    assert "HTMLMediaElement.prototype.play" in script
+    assert "audio,video" in script
+    assert "shadowRoot" in script
     assert "本地音乐" in script
     assert "尚未识别当前歌曲" in script
     assert "lxmusic:'洛雪聚合'" in script
