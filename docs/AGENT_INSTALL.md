@@ -37,7 +37,7 @@
   4. Docker / Host 模式决策：
      - 运行 command -v docker 检测 Docker 环境：
        * 若已安装 Docker：采用 --mode docker（推荐，音源在 compose 轻量无特权容器中运行，隔离最彻底）。
-       * 若未安装 Docker：采用 --mode host（使用项目内独立的 .venv-musicdl / .venv-musicbox 虚拟环境运行并注册为 systemd 服务，纯净轻量，零全局依赖污染；切勿擅自安装 Docker）。
+       * 若未安装 Docker：采用 --mode host（使用项目内独立的 .venv-musicdl / .venv-musicbox / .venv-lxmusic 虚拟环境运行并注册为 systemd 服务，纯净轻量，零全局依赖污染；切勿擅自安装 Docker）。
 
 步骤 3：执行安装与一步到位启用（--extend）
 推荐使用 --extend 参数，让 install.sh 在依赖就绪、服务配置完成后自动调用 ./extend.sh 进行 Unix Domain Socket 接管与端到端验收自检，实现安装+接管一步到位：
@@ -48,7 +48,7 @@
   - Host 模式（宿主机独立 venv，双音源一步到位）：
     ./install.sh --non-interactive --mode host --sources musicdl,musicbox,qqmusic,lx --extend
   - 若用户提供了 OpenAI 兼容的 Base URL 与 API Key，则追加大模型参数（密钥仅写入 .env，禁止 echo 到日志）：
-    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox \
+    ./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic \
       --enable-recommend \
       --llm-base-url '<用户提供的 URL>' \
       --llm-api-key '<用户提供的 KEY>' \
@@ -79,7 +79,7 @@
 【完成汇报规范】
 任务完成后用简短中文输出总结，内容包含：
 1. 部署模式判断（Docker 模式或 Host 模式，及环境预检依据）；
-2. 启用的音源与端口说明（musicdl: 127.0.0.1:8768，musicbox: 0.0.0.0:8770 局域网扫码地址）；
+2. 启用的音源与端口说明（musicdl: 127.0.0.1:8768，musicbox: 0.0.0.0:8770，QQ: 127.0.0.1:8771，洛雪自定义源: 127.0.0.1:8772，洛雪聚合: 127.0.0.1:8773）；
 3. 每日推荐是否开启（严禁复述敏感密钥）；
 4. healthz 接口探测响应 JSON；
 5. extend 链路接管与验收状态。

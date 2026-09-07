@@ -94,6 +94,29 @@ services:
       retries: 3
       start_period: 5s
 
+  lxmusic:
+    build:
+      context: ./lxmusic-service
+      dockerfile: Dockerfile
+    container_name: fnmusic-lxmusic
+    ports:
+      - "127.0.0.1:8773:8000"
+    environment:
+      - LX_SOURCES=kg,wy,mg
+      - LX_SEARCH_TIMEOUT=12
+      - LX_LIMIT_PER_SOURCE=50
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
 volumes:
   qqmusic-data:
   lx-source-data:

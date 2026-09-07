@@ -38,6 +38,7 @@ def setup_netease_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "lyric_field", "data.lyric")
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
     monkeypatch.setitem(CONF, "netease_wait_s", 2.5)
     monkeypatch.setitem(CONF, "netease_quality", "lossless")
     monkeypatch.setitem(CONF, "search_cache_ttl", 300.0)
@@ -825,15 +826,15 @@ def test_search_cache_eviction():
     _SEARCH_CACHE.clear()
     now = time.time()
 
-    # 填充 201 条缓存
-    for i in range(205):
+    # 填充 2005 条缓存
+    for i in range(2005):
         _set_search_cache(f"kw_{i}", {"items": [f"item_{i}"], "ts": now + i, "task": None})
 
-    # 断言超过 200 时，清理掉最旧的一半
-    assert len(_SEARCH_CACHE) <= 200
+    # 断言超过 2000 时，清理掉最旧的一半
+    assert len(_SEARCH_CACHE) <= 2000
     assert "kw_0" not in _SEARCH_CACHE
-    assert "kw_50" not in _SEARCH_CACHE
-    assert "kw_204" in _SEARCH_CACHE
+    assert "kw_500" not in _SEARCH_CACHE
+    assert "kw_2004" in _SEARCH_CACHE
 
 
 # =========================================================================
@@ -1071,6 +1072,7 @@ def test_healthz_musicbox_only(monkeypatch):
 def test_healthz_both_sources_down_is_unhealthy(monkeypatch):
     monkeypatch.setitem(CONF, "musicdl_enabled", True)
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "lx_enabled", False)
 
     def upstream_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"code": 0})

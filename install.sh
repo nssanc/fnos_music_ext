@@ -13,19 +13,24 @@ set -euo pipefail
 # 用法:
 #   ./install.sh                         # 交互
 #   ./install.sh --mode host
-#   ./install.sh --mode docker --sources musicdl,musicbox
+#   ./install.sh --mode docker --sources=1,2,3
+#   ./install.sh --mode docker --sources musicbox,lxmusic
 #   ./install.sh --non-interactive --mode docker --enable-recommend \
 #       --llm-base-url https://api.example.com/v1 --llm-api-key '***' --llm-model gpt-4o-mini
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 MODE=""
 SOURCES_RAW=""
 NON_INTERACTIVE=0
 ENABLE_RECOMMEND=""
 LLM_BASE_URL=""
 LLM_API_KEY=""
-LLM_MODEL="gpt-4o-mini"
+LLM_MODEL=""
+LLM_MODEL_FROM_CLI=0
+DEFAULT_LLM_MODEL="gpt-4o-mini"
 RUN_EXTEND=0
 FIX_DOCKER_PERMISSIONS=0
 ENABLE_MUSICDL=0
@@ -58,8 +63,9 @@ usage() {
   --disable-recommend    明确关闭每日推荐
   --llm-base-url URL     OpenAI 兼容 Base URL，例如 https://api.openai.com/v1
   --llm-api-key KEY      API Key（不会回显；请勿提交到 git）
-  --llm-model NAME       模型名，默认 gpt-4o-mini
+  --llm-model NAME       模型名；交互模式可自动拉取列表选择；非交互缺省 gpt-4o-mini
   --extend               安装完成后立即执行 ./extend.sh
+  --qr                   在终端展示网易云登录二维码
   -h, --help             显示帮助
 
 密钥只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
@@ -182,24 +188,76 @@ stop_docker_container() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --mode) MODE="${2:-}"; shift 2 ;;
-        --sources) SOURCES_RAW="${2:-}"; shift 2 ;;
+        --mode)
+            [ $# -ge 2 ] || { log_err "--mode 需要参数 host|docker"; exit 1; }
+            MODE="${2}"; shift 2 ;;
+        --mode=*) MODE="${1#*=}"; shift ;;
+        --sources)
+            [ $# -ge 2 ] || { log_err "--sources 需要音源列表参数"; exit 1; }
+            SOURCES_RAW="${2}"; shift 2 ;;
+        --sources=*) SOURCES_RAW="${1#*=}"; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
         --fix-docker-permissions) FIX_DOCKER_PERMISSIONS=1; shift ;;
         --enable-recommend) ENABLE_RECOMMEND="yes"; shift ;;
         --disable-recommend) ENABLE_RECOMMEND="no"; shift ;;
-        --llm-base-url) LLM_BASE_URL="${2:-}"; shift 2 ;;
-        --llm-api-key) LLM_API_KEY="${2:-}"; shift 2 ;;
-        --llm-model) LLM_MODEL="${2:-}"; shift 2 ;;
+        --llm-base-url)
+            [ $# -ge 2 ] || { log_err "--llm-base-url 需要 URL 参数"; exit 1; }
+            LLM_BASE_URL="${2}"; shift 2 ;;
+        --llm-api-key)
+            [ $# -ge 2 ] || { log_err "--llm-api-key 需要 KEY 参数"; exit 1; }
+            LLM_API_KEY="${2}"; shift 2 ;;
+        --llm-model)
+            [ $# -ge 2 ] || { log_err "--llm-model 需要模型名参数"; exit 1; }
+            LLM_MODEL="${2}"
+            LLM_MODEL_FROM_CLI=1
+            shift 2 ;;
         --extend) RUN_EXTEND=1; shift ;;
+        --qr)
+            curl -s http://127.0.0.1:8770/api/v1/auth/login/qr || true
+            exit 0
+            ;;
         -h|--help) usage; exit 0 ;;
         *) log_err "未知参数: $1"; usage; exit 1 ;;
     esac
 done
 
+run_docker() {
+    if docker info >/dev/null 2>&1; then
+        docker "$@"
+    elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+        sudo docker "$@"
+    else
+        return 1
+    fi
+}
+
+# 容器名全局固定（fnmusic-*）；若被其他副本/并发任务的容器占用，移除后由当前目录接管
+reclaim_container() {
+    local name="$1" owner=""
+    if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
+        return 0
+    fi
+    owner="$(run_docker container inspect "${name}" \
+        --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+    log_info "检测到同名容器 ${name}（来自 ${owner:-未知目录}），移除后由当前目录接管..."
+    if ! run_docker rm -f "${name}"; then
+        log_err "无法移除同名容器 ${name}，请手动执行: docker rm -f ${name}"
+        return 1
+    fi
+}
+
 precheck_environment() {
     log_info "==> 开始安装环境预检..."
     local precheck_failed=0
+
+    # 0. curl（健康探测 / 验收 / 二维码均依赖）
+    if ! command -v curl >/dev/null 2>&1; then
+        log_err "【缺少基础组件】系统未检测到 curl。"
+        log_err "请先执行：sudo apt-get update && sudo apt-get install -y curl"
+        precheck_failed=1
+    else
+        log_info "curl 已就绪。"
+    fi
 
     # 1. 检查 Python 3 与 venv 模块
     if ! command -v python3 >/dev/null 2>&1; then
@@ -243,7 +301,15 @@ precheck_environment() {
 
     # 4. 检查 Docker 环境
     if command -v docker >/dev/null 2>&1; then
-        log_info "Docker 容器环境已就绪。"
+        if run_docker info >/dev/null 2>&1; then
+            log_info "Docker 容器环境已就绪。"
+        else
+            log_warn "检测到 docker 命令，但当前用户无法连通 Docker daemon。"
+            if [ "${MODE}" = "docker" ]; then
+                log_err "【权限不足】Docker 模式需要可用的 docker（或 sudo docker）。"
+                precheck_failed=1
+            fi
+        fi
     else
         log_warn "【提示】系统未检测到 Docker 环境。"
         if [ "${MODE}" = "docker" ]; then
@@ -261,6 +327,14 @@ precheck_environment() {
         exit 1
     fi
     log_info "环境预检全部通过。"
+}
+
+ensure_docker_ready() {
+    if ! command -v docker >/dev/null 2>&1 || ! run_docker info >/dev/null 2>&1; then
+        log_err "【缺少组件】已选择 Docker 模式，但 Docker 不可用。"
+        log_err "请先在 fnOS 应用中心安装 Docker，或改用 --mode host。"
+        exit 1
+    fi
 }
 
 precheck_environment
@@ -281,19 +355,135 @@ prompt() {
     fi
 }
 
+# 从 OpenAI 兼容接口拉取模型列表（失败返回空；不打印 API Key）
+fetch_llm_models() {
+    local base_url="$1" api_key="$2"
+    local models_url tmp_body http_code
+    base_url="${base_url%/}"
+    models_url="${base_url}/models"
+    tmp_body="$(mktemp)"
+    http_code="$(
+        curl -sS --max-time 15 \
+            -H "Authorization: Bearer ${api_key}" \
+            -H "Content-Type: application/json" \
+            -o "${tmp_body}" -w "%{http_code}" \
+            "${models_url}" 2>/dev/null || echo "000"
+    )"
+    if [ "${http_code}" != "200" ]; then
+        rm -f "${tmp_body}"
+        return 1
+    fi
+    if ! python3 - "${tmp_body}" <<'PY' 2>/dev/null
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+rows = []
+if isinstance(data, dict):
+    raw = data.get("data")
+    if isinstance(raw, list):
+        rows = raw
+    elif isinstance(data.get("models"), list):
+        rows = data["models"]
+elif isinstance(data, list):
+    rows = data
+ids = []
+seen = set()
+for it in rows:
+    mid = ""
+    if isinstance(it, dict):
+        mid = str(it.get("id") or it.get("name") or it.get("model") or "").strip()
+    elif isinstance(it, str):
+        mid = it.strip()
+    if mid and mid not in seen:
+        seen.add(mid)
+        ids.append(mid)
+if not ids:
+    sys.exit(1)
+for mid in ids:
+    print(mid)
+PY
+    then
+        rm -f "${tmp_body}"
+        return 1
+    fi
+    rm -f "${tmp_body}"
+    return 0
+}
+
+# 交互选择模型：优先展示拉取到的列表，失败则手写
+prompt_llm_model() {
+    local base_url="$1" api_key="$2"
+    local models=() line i choice custom def_idx=1
+    log_info "正在从接口拉取可用模型列表..."
+    while IFS= read -r line; do
+        [ -n "${line}" ] && models+=("${line}")
+    done < <(fetch_llm_models "${base_url}" "${api_key}" || true)
+
+    if [ "${#models[@]}" -eq 0 ]; then
+        log_warn "未能自动获取模型列表（接口不可达、鉴权失败或返回格式不兼容）。"
+        LLM_MODEL="$(prompt "请手动输入模型名称" "${DEFAULT_LLM_MODEL}")"
+        LLM_MODEL="${LLM_MODEL:-${DEFAULT_LLM_MODEL}}"
+        return 0
+    fi
+
+    local max_show=40 total="${#models[@]}"
+    if [ "${total}" -gt "${max_show}" ]; then
+        log_info "接口返回 ${total} 个模型，列表仅展示前 ${max_show} 个；其余请选 0 自定义输入。"
+    fi
+    echo "可用模型："
+    local show_count="${total}"
+    [ "${show_count}" -gt "${max_show}" ] && show_count="${max_show}"
+    for i in $(seq 0 $((show_count - 1))); do
+        echo "  $((i + 1))) ${models[$i]}"
+    done
+    echo "  0) 自定义输入模型名称"
+    # 默认选第一项；若可见列表含默认模型名则优先
+    for i in $(seq 0 $((show_count - 1))); do
+        if [ "${models[$i]}" = "${DEFAULT_LLM_MODEL}" ]; then
+            def_idx=$((i + 1))
+            break
+        fi
+    done
+    choice="$(prompt "请选择模型编号（0=自定义）" "${def_idx}")"
+    case "${choice}" in
+        0)
+            custom="$(prompt "请输入自定义模型名称" "${DEFAULT_LLM_MODEL}")"
+            LLM_MODEL="${custom:-${DEFAULT_LLM_MODEL}}"
+            ;;
+        ''|*[!0-9]*)
+            log_warn "输入无效，使用默认模型 ${models[$((def_idx - 1))]}。"
+            LLM_MODEL="${models[$((def_idx - 1))]}"
+            ;;
+        *)
+            if [ "${choice}" -ge 1 ] && [ "${choice}" -le "${show_count}" ]; then
+                LLM_MODEL="${models[$((choice - 1))]}"
+            else
+                log_warn "编号超出范围，使用默认模型 ${models[$((def_idx - 1))]}。"
+                LLM_MODEL="${models[$((def_idx - 1))]}"
+            fi
+            ;;
+    esac
+    log_info "已选择模型: ${LLM_MODEL}"
+}
+
 if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "============================================================"
-    echo " fnmusic-ext 安装配置向导"
-    echo " 音源: ${MUSICDL_REPO}"
-    echo "       ${MUSICBOX_REPO}"
+    echo " fnmusic-ext 安装配置向导  v${FNMUSIC_VERSION}"
+    echo " 音源: ${MUSICBOX_REPO}"
+    echo "       ${MUSICDL_REPO}"
+    echo "       lxmusic — 洛雪音乐源（免登录解析：酷狗/网易/咪咕）"
     echo "============================================================"
     if [ -z "${MODE}" ]; then
         echo "【安装模式说明】"
         echo "  无论选哪种模式，核心代理（fnmusic-ext）均以宿主机 systemd 运行接管 Socket。"
-        echo "  两种模式区别仅在于音源服务（musicdl/musicbox）的部署运行形态："
+        echo "  两种模式区别仅在于音源服务（musicbox/musicdl/lxmusic）的部署运行形态："
         if command -v docker >/dev/null 2>&1; then
             echo "  1) docker  — [推荐] Docker 容器模式："
-            echo "               通过 compose 运行轻量容器（端口 8768/8770，无特权，数据隔离在 musicbox-data/）"
+            echo "               通过 compose 运行轻量容器（端口 8768/8770/8772，无特权，数据隔离在 musicbox-data/）"
             echo "  2) host    — Host 宿主机本地服务模式（纯净无 Docker）："
             echo "               创建独立 Python venv 并注册为 systemd 服务（监听 127.0.0.1，不污染全局环境）"
             local_choice="$(prompt "请选择安装模式 (输入 1 或 2)" "1")"
@@ -333,13 +523,17 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
             read -r -s -p "LLM API Key（输入不回显，留空则不开启推荐）: " LLM_API_KEY || true
             echo
         fi
-        [ -z "${LLM_MODEL}" ] && LLM_MODEL="$(prompt "LLM 模型名" "gpt-4o-mini")"
-        LLM_MODEL="${LLM_MODEL:-gpt-4o-mini}"
         if [ -z "${LLM_BASE_URL}" ] || [ -z "${LLM_API_KEY}" ]; then
             log_warn "未同时提供 Base URL 与 API Key，每日推荐将关闭。"
             ENABLE_RECOMMEND="no"
             LLM_BASE_URL=""
             LLM_API_KEY=""
+            LLM_MODEL=""
+        elif [ "${LLM_MODEL_FROM_CLI}" -eq 1 ] && [ -n "${LLM_MODEL}" ]; then
+            log_info "使用命令行指定的模型: ${LLM_MODEL}"
+        else
+            # 仅在开启推荐且已有 URL/Key 时拉取模型列表并让用户选择
+            prompt_llm_model "${LLM_BASE_URL}" "${LLM_API_KEY}"
         fi
     fi
     ext_choice="$(prompt "安装配置完成，是否立即执行 extend.sh 启用扩展? [Y/n]" "Y")"
@@ -355,10 +549,12 @@ else
             log_err "--enable-recommend 需要同时提供 --llm-base-url 与 --llm-api-key"
             exit 1
         fi
+        LLM_MODEL="${LLM_MODEL:-${DEFAULT_LLM_MODEL}}"
     else
         ENABLE_RECOMMEND="no"
         LLM_BASE_URL=""
         LLM_API_KEY=""
+        LLM_MODEL=""
     fi
 fi
 
@@ -366,6 +562,9 @@ MODE="${MODE:-docker}"
 if [ "${MODE}" != "host" ] && [ "${MODE}" != "docker" ]; then
     log_err "mode 必须是 host 或 docker"
     exit 1
+fi
+if [ "${MODE}" = "docker" ]; then
+    ensure_docker_ready
 fi
 
 if [ "${MODE}" = "docker" ]; then
@@ -380,13 +579,17 @@ SELECTED=""
 [ "${ENABLE_QQMUSIC}" -eq 1 ] && SELECTED="${SELECTED} qqmusic"
 [ "${ENABLE_LX}" -eq 1 ] && SELECTED="${SELECTED} lx"
 
+log_info "fnmusic-ext v${FNMUSIC_VERSION}"
 log_info "安装模式: ${MODE}"
 log_info "音源:${SELECTED}"
 log_info "每日推荐: ${ENABLE_RECOMMEND}"
 log_info "项目目录: ${BASE_DIR}"
 
-mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" "${BASE_DIR}/musicbox-data"
-chmod 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
+mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/play_history" "${BASE_DIR}/recommend_cache" \
+    "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
+    "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
+    "${BASE_DIR}/musicbox-data/netease-musicbox"
+chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
 
 MUSICDL_FLAG="false"
 MUSICBOX_FLAG="false"
@@ -397,9 +600,10 @@ LX_FLAG="false"
 [ "${ENABLE_QQMUSIC}" -eq 1 ] && QQMUSIC_FLAG="true"
 [ "${ENABLE_LX}" -eq 1 ] && LX_FLAG="true"
 
-# --- 写 .env（脱敏：不打印 key） ---
+# --- 写 .env（防覆盖：安全增量合并，脱敏：不打印 key） ---
 ENV_PATH="${BASE_DIR}/.env"
 umask 077
+ENV_DESIRED="$(mktemp)"
 {
     echo "# generated by install.sh — do not commit"
     echo "FNMUSIC_INSTALL_MODE='${MODE}'"
@@ -419,6 +623,11 @@ umask 077
     echo "FNMUSIC_QQMUSIC_QUALITY='F000'"
     echo "FNMUSIC_LX_SOURCE_ENABLED='${LX_FLAG}'"
     echo "FNMUSIC_LX_SOURCE_URL='http://127.0.0.1:8772'"
+    echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"
+    echo "FNMUSIC_LX_URL='http://127.0.0.1:8773'"
+    echo "FNMUSIC_LX_SEARCH_LIMIT='50'"
+    echo "FNMUSIC_LX_QUALITY='lossless'"
+    echo "FNMUSIC_DEPLOY_MODE='${MODE}'"
     echo "FNMUSIC_SOURCE_CONFIG='$(dotenv_escape "${BASE_DIR}/source-config.json")'"
     echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     echo "FNMUSIC_ONLINE_LIMIT='100'"
@@ -433,9 +642,52 @@ umask 077
         echo "FNMUSIC_LLM_API_KEY=''"
         echo "FNMUSIC_LLM_MODEL=''"
     fi
-} > "${ENV_PATH}"
+    echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
+} > "${ENV_DESIRED}"
+
+# 用户本次明确提供了新值的键（音源开关/版本/部署模式为安装时部署选项，始终采用新值）
+ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_QQMUSIC_ENABLED,FNMUSIC_LX_SOURCE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE"
+[ "${ENABLE_LX}" -eq 1 ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LX_URL"
+if [ "${ENABLE_RECOMMEND}" = "yes" ]; then
+    [ -n "${LLM_BASE_URL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL"
+    [ -n "${LLM_API_KEY}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_API_KEY"
+    [ -n "${LLM_MODEL}" ] && ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_MODEL"
+else
+    # 关闭推荐时必须显式覆盖，否则 env_merge 会保留旧 Key
+    ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_LLM_BASE_URL,FNMUSIC_LLM_API_KEY,FNMUSIC_LLM_MODEL"
+fi
+
+if [ -f "${ENV_PATH}" ]; then
+    PREV_VERSION="$(grep -E "^\s*(export\s+)?FNMUSIC_VERSION=" "${ENV_PATH}" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]" || true)"
+    PREV_VERSION="${PREV_VERSION:-}"
+    ENV_BACKUP="${ENV_PATH}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "${ENV_PATH}" "${ENV_BACKUP}"
+    if [ -n "${PREV_VERSION}" ] && [ "${PREV_VERSION}" = "${FNMUSIC_VERSION}" ]; then
+        log_warn "检测到同版本 (v${FNMUSIC_VERSION}) 重复安装：现有配置将被保护，"
+        log_warn "仅补齐缺失配置项；密钥/自定义路径/ONLINE_SOURCES 等沿用已有值（备份: ${ENV_BACKUP}）。"
+    else
+        log_info "检测到已有配置（v${PREV_VERSION:-未知} -> v${FNMUSIC_VERSION}）平滑升级："
+        log_info "保留用户自定义配置与密钥，仅安全补齐新增/缺失配置项（备份: ${ENV_BACKUP}）。"
+    fi
+    MERGE_SUMMARY="$(python3 "${BASE_DIR}/proxy/env_merge.py" \
+        --existing "${ENV_PATH}" --desired "${ENV_DESIRED}" \
+        --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" 2>&1)" || {
+        log_err "配置合并失败，已保留原配置不动: ${ENV_PATH}"
+        rm -f "${ENV_DESIRED}"
+        exit 1
+    }
+    log_info "配置合并完成 (v${FNMUSIC_VERSION})："
+    while IFS= read -r line; do
+        [ -n "${line}" ] && log_info "  ${line}"
+    done <<< "${MERGE_SUMMARY}"
+else
+    python3 "${BASE_DIR}/proxy/env_merge.py" \
+        --existing /dev/null --desired "${ENV_DESIRED}" \
+        --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
+    log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
+fi
+rm -f "${ENV_DESIRED}"
 chmod 600 "${ENV_PATH}"
-log_info "已写入 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
 
 # --- 代理 Python 环境 ---
 if ! command -v python3 >/dev/null 2>&1; then
@@ -526,6 +778,10 @@ install_musicbox_docker() {
         log_err "未找到 docker，无法使用 docker 模式。请安装 Docker 或改用 --mode host"
         return 1
     fi
+    mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/netease-musicbox"
+    chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
     log_info "构建并启动 musicbox 容器（基于 ${MUSICBOX_REPO}）..."
     sudo systemctl disable --now fnmusic-musicbox.service 2>/dev/null || true
     docker_cmd compose -f "${BASE_DIR}/docker-compose.yml" up -d --build musicbox
@@ -561,7 +817,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=XDG_DATA_HOME=${BASE_DIR}/musicbox-data
 Environment=XDG_CACHE_HOME=${BASE_DIR}/musicbox-data/cache
 Environment=XDG_CONFIG_HOME=${BASE_DIR}/musicbox-data/config
-ExecStart=${BASE_DIR}/.venv-musicbox/bin/uvicorn app:app --host 127.0.0.1 --port 8770
+ExecStart=${BASE_DIR}/.venv-musicbox/bin/uvicorn app:app --host 0.0.0.0 --port 8770
 Restart=always
 RestartSec=5
 
@@ -711,6 +967,49 @@ EOF
     wait_http "http://127.0.0.1:8772/healthz" 30 1 || log_warn "洛雪自定义源服务尚未就绪，请检查 journalctl -u fnmusic-lx-source"
 }
 
+# --- Searchable LX aggregation source ---
+install_lxmusic_docker() {
+    log_info "构建并启动洛雪聚合搜索容器..."
+    sudo systemctl disable --now fnmusic-lxmusic.service 2>/dev/null || true
+    reclaim_container fnmusic-lxmusic || return 1
+    docker_cmd compose -f "${BASE_DIR}/docker-compose.yml" up -d --build lxmusic
+    wait_http "http://127.0.0.1:8773/healthz" 60 2 \
+        || { log_err "等待洛雪聚合搜索服务超时"; return 1; }
+}
+
+install_lxmusic_host() {
+    log_info "宿主机安装洛雪聚合搜索服务..."
+    stop_docker_container fnmusic-lxmusic
+    if [ ! -x "${BASE_DIR}/.venv-lxmusic/bin/python" ]; then
+        python3 -m venv "${BASE_DIR}/.venv-lxmusic"
+    fi
+    "${BASE_DIR}/.venv-lxmusic/bin/pip" install -q -U pip -i "${PIP_INDEX}"
+    "${BASE_DIR}/.venv-lxmusic/bin/pip" install -q -r "${BASE_DIR}/lxmusic-service/requirements.txt" -i "${PIP_INDEX}"
+    local unit
+    unit="$(mktemp)"
+    cat > "${unit}" <<EOF
+[Unit]
+Description=fnmusic-ext searchable LX aggregation source
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${BASE_DIR}/lxmusic-service
+Environment=PYTHONUNBUFFERED=1
+Environment=LX_SOURCES=kg,wy,mg
+ExecStart=${BASE_DIR}/.venv-lxmusic/bin/uvicorn app:app --host 127.0.0.1 --port 8773
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    install_unit "${unit}" /etc/systemd/system/fnmusic-lxmusic.service || return 0
+    wait_http "http://127.0.0.1:8773/healthz" 30 1 \
+        || log_warn "洛雪聚合服务尚未就绪，请检查 journalctl -u fnmusic-lxmusic"
+}
+
 stop_unselected() {
     if [ "${ENABLE_MUSICDL}" -eq 0 ]; then
         stop_docker_container fnmusic-musicdl
@@ -726,20 +1025,41 @@ stop_unselected() {
     fi
     if [ "${ENABLE_LX}" -eq 0 ]; then
         stop_docker_container fnmusic-lx-source
+        stop_docker_container fnmusic-lxmusic
         sudo systemctl disable --now fnmusic-lx-source.service 2>/dev/null || true
+        sudo systemctl disable --now fnmusic-lxmusic.service 2>/dev/null || true
     fi
 }
 
+clear_opposite_mode() {
+    if [ "${MODE}" = "docker" ]; then
+        for unit in fnmusic-musicdl fnmusic-musicbox fnmusic-qqmusic fnmusic-lx-source fnmusic-lxmusic; do
+            sudo systemctl disable --now "${unit}.service" 2>/dev/null || true
+        done
+    else
+        for container in fnmusic-musicdl fnmusic-musicbox fnmusic-qqmusic fnmusic-lx-source fnmusic-lxmusic; do
+            stop_docker_container "${container}"
+        done
+    fi
+}
+
+clear_opposite_mode
 if [ "${MODE}" = "docker" ]; then
     [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_docker
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_docker
     [ "${ENABLE_QQMUSIC}" -eq 1 ] && install_qqmusic_docker
-    [ "${ENABLE_LX}" -eq 1 ] && install_lx_docker
+    if [ "${ENABLE_LX}" -eq 1 ]; then
+        install_lx_docker
+        install_lxmusic_docker
+    fi
 else
     [ "${ENABLE_MUSICDL}" -eq 1 ] && install_musicdl_host
     [ "${ENABLE_MUSICBOX}" -eq 1 ] && install_musicbox_host
     [ "${ENABLE_QQMUSIC}" -eq 1 ] && install_qqmusic_host
-    [ "${ENABLE_LX}" -eq 1 ] && install_lx_host
+    if [ "${ENABLE_LX}" -eq 1 ]; then
+        install_lx_host
+        install_lxmusic_host
+    fi
 fi
 stop_unselected
 
@@ -758,7 +1078,14 @@ python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py
 bash -n "${BASE_DIR}/extend.sh" "${BASE_DIR}/restore.sh" "${BASE_DIR}/proxy/run_proxy.sh"
 
 log_info "============================================================"
-log_info "🎉 fnmusic-ext 安装配置完成！已启用音源:${SELECTED}"
+log_info "🎉 fnmusic-ext v${FNMUSIC_VERSION} 安装配置完成！"
+log_info "已启用音源（安装模式: ${MODE}）:${SELECTED}"
+log_info "------------------------------------------------------------"
+log_info "【音源服务状态】"
+[ "${ENABLE_MUSICBOX}" -eq 1 ] && log_info "  • musicbox  [8770] 网易云音源     http://127.0.0.1:8770/healthz"
+[ "${ENABLE_MUSICDL}" -eq 1 ] && log_info "  • musicdl   [8768] 聚合音源      http://127.0.0.1:8768/healthz"
+[ "${ENABLE_LX}" -eq 1 ] && log_info "  • lx-source [8772] 洛雪自定义源  http://127.0.0.1:8772/healthz"
+[ "${ENABLE_LX}" -eq 1 ] && log_info "  • lxmusic   [8773] 洛雪聚合搜索  http://127.0.0.1:8773/healthz"
 log_info "------------------------------------------------------------"
 log_info "【后续验证与使用指引】"
 if [ "${RUN_EXTEND}" -eq 1 ]; then
@@ -773,8 +1100,11 @@ log_info "   打开飞牛音乐 Web 端或手机 App，在搜索框中搜索歌�
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "3. 网易云扫码登录（可选）："
-    log_info "   部分网易云 VIP/无损歌曲需要账号凭证，可在局域网浏览器中访问："
-    log_info "   http://<NAS_IP>:8770/api/v1/auth/login/qr.png 扫码登录即可。"
+    log_info "   部分网易云 VIP/无损歌曲需要账号凭证："
+    log_info "   • 终端直接扫码（推荐）: curl -s http://127.0.0.1:8770/api/v1/auth/login/qr"
+    log_info "     （或在终端运行 ./install.sh --qr 或 ./extend.sh --qr 查看）"
+    log_info "   • 局域网浏览器图片: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+    log_info "   • 检查登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
 fi
 if [ "${ENABLE_QQMUSIC}" -eq 1 ] || [ "${ENABLE_LX}" -eq 1 ]; then
     log_info "4. 在线音源设置："
@@ -791,5 +1121,5 @@ log_info "   • 随时一键还原: ./restore.sh (立即恢复官方出厂直�
 log_info "============================================================"
 
 if [ "${RUN_EXTEND}" -eq 1 ]; then
-    exec "${BASE_DIR}/extend.sh"
+    exec "${BASE_DIR}/extend.sh" --force
 fi

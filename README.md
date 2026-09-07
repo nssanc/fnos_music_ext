@@ -2,7 +2,7 @@
 
 `fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）量身定制的无侵入式扩展代理。通过 Unix Domain Socket 接管官方后端入口，为飞牛 Web 端及使用飞牛原生 API 的第三方客户端无缝提供全网在线聚合搜索、流式播放、歌词与封面解析、边播边落盘，以及基于大模型的每日推荐歌单。
 
-可选音源支持：[musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等）、[musicbox](https://github.com/darknessomi/musicbox)（网易云高品质）、QQ 音乐扫码登录与会员音质，以及兼容[洛雪自定义源脚本](https://lxmusic.toside.cn/desktop/custom-source)的播放地址兜底。本项目不修改飞牛官方 nginx 配置、不 Patch 官方二进制、不改动官方数据库。
+可选音源支持：[musicdl](https://github.com/CharlesPikachu/musicdl)（酷我/咪咕等）、[musicbox](https://github.com/darknessomi/musicbox)（网易云高品质）、QQ 音乐扫码登录与会员音质、可直接参与搜索的洛雪聚合服务，以及兼容[洛雪自定义源脚本](https://lxmusic.toside.cn/desktop/custom-source)的播放地址兜底。本项目不修改飞牛官方 nginx 配置、不 Patch 官方二进制、不改动官方数据库。
 
 > ⚠️ **使用前须知**：本项目基于 MIT 协议开源，仅供个人技术研究与交流使用，请务必阅读文末的 [免责与版权声明](#免责与版权声明disclaimer--copyright-notice)。
 
@@ -126,6 +126,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
        - `fnmusic-musicbox`：端口 `0.0.0.0:8770`（网易云高品质解析；局域网可访问二维码扫码）；
        - `fnmusic-qqmusic`：端口 `127.0.0.1:8771`（QQ 搜索、扫码会话与会员音质）；
        - `fnmusic-lx-source`：端口 `127.0.0.1:8772`（洛雪脚本隔离运行器）；
+       - `fnmusic-lxmusic`：端口 `127.0.0.1:8773`（洛雪聚合搜索、歌词与播放解析）；
      * **容器网络与权限**：容器内无特权（非 root 普通用户运行），数据卷严格隔离在当前项目目录下的 `musicbox-data/` 目录中；
    - **方式 B：Host 宿主机本地服务模式（纯净无 Docker）**：
      * **适合场景**：系统未安装 Docker，或追求极致轻量、超低内存占用的机器；
@@ -432,6 +433,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
   - **多平台聚合 (`musicdl` :8768)**：[CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl)，酷我、咪咕等。
   - **QQ 音乐 (`qqmusic` :8771)**：搜索、二维码授权、歌词及按账号权益解析的会员音质。
   - **洛雪自定义源 (`lx-source` :8772)**：兼容洛雪脚本协议，作为已搜索曲目的播放地址兜底，不单独提供搜索元数据。
+  - **洛雪聚合源 (`lxmusic` :8773)**：聚合酷狗、网易云和咪咕，可直接参与搜索、歌词、封面与播放解析；与自定义脚本运行器并存。
   运行时开关由 `.env` 初始值和 `source-config.json` 的设置面板覆盖值共同控制；`/_ext/healthz` 在上游健康且**至少一个可搜索音源健康**时为 `ok`。
 - **毫秒级鉴权与快速路径**：
   - 未登录（401 / Token 无效）请求走本地毫秒级判定，不等待外部音源，耗时 `< 0.1s`。
@@ -550,6 +552,7 @@ fnmusic_ext/
 ├── musicbox-service/          # darknessomi/musicbox HTTP 包装 (:8770)
 ├── qqmusic-service/           # 固定版本 QQMusicapi 容器 (:8771)
 ├── lx-source-service/         # 洛雪自定义源隔离运行器 (:8772)
+├── lxmusic-service/           # 洛雪聚合搜索与播放服务 (:8773)
 ├── docs/
 │   ├── INSTALL.md             # 人工安装
 │   └── AGENT_INSTALL.md       # Agent 安装提示词
@@ -581,11 +584,15 @@ fnmusic_ext/
 | `FNMUSIC_QQMUSIC_QUALITY` | `F000` | QQ 首选音质；无权益时自动降级 |
 | `FNMUSIC_LX_SOURCE_ENABLED` | `false` | 是否启用洛雪脚本播放兜底 |
 | `FNMUSIC_LX_SOURCE_URL` | `http://127.0.0.1:8772` | 洛雪脚本运行服务地址 |
+| `FNMUSIC_LX_ENABLED` | `true` | 是否启用可搜索的洛雪聚合服务 |
+| `FNMUSIC_LX_URL` | `http://127.0.0.1:8773` | 洛雪聚合搜索服务地址 |
+| `FNMUSIC_LX_SEARCH_LIMIT` | `50` | 洛雪聚合单次搜索上限 |
+| `FNMUSIC_LX_QUALITY` | `lossless` | 洛雪聚合首选音质；失败时自动降级 |
 | `FNMUSIC_SOURCE_CONFIG` | `$FNMUSIC_HOME/source-config.json` | 设置面板运行时开关文件，权限 `600` |
 | `FNMUSIC_UPSTREAM_SOCK` | `/var/run/trim_music_upstream.socket` | 飞牛音乐原生 Unix Socket 路径 |
 | `FNMUSIC_ONLINE_LIMIT` | `100` | 每页在线合并安全上限；实际按前端请求的 `size` 持续分页 |
 | `FNMUSIC_MERGE_SUGGEST` | `true` | 顶部搜索建议是否合并在线歌曲、歌手、专辑和歌单 |
-| `FNMUSIC_SEARCH_CACHE_TTL` | `300` | 搜索聚合缓存有效期（秒） |
+| `FNMUSIC_SEARCH_CACHE_TTL` | `604800` | 搜索聚合缓存有效期（秒，默认 7 天） |
 | `FNMUSIC_CACHE_DIR` | `$FNMUSIC_HOME/cache` | 在线音频 Tee 缓存落盘目录 |
 | `FNMUSIC_FAV_DIR` | `$FNMUSIC_HOME/online_favorites/` | 多用户在线收藏存储目录 |
 | `FNMUSIC_ONLINE_SOURCES` | `KuwoMusicClient,MiguMusicClient` | musicdl 音源白名单 |

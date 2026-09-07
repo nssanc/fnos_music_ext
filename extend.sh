@@ -8,12 +8,15 @@ set -euo pipefail
 # ==============================================================================
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 MUSICDL_URL="http://127.0.0.1:8768"
 MUSICBOX_URL="http://127.0.0.1:8770"
 QQMUSIC_URL="http://127.0.0.1:8771"
 LX_SOURCE_URL="http://127.0.0.1:8772"
+LXMUSIC_URL="http://127.0.0.1:8773"
 INSTALL_MODE="auto"
 
 log_info() {
@@ -33,6 +36,47 @@ is_enabled() {
         false|0|no|off) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+# ------------------------------------------------------------------------------
+# 获取 fnOS 网关 http/https 端口 (读取失败时默认 5666/5667)
+# 输出: "<http_port> <https_port>"
+# ------------------------------------------------------------------------------
+get_fnos_gateway_ports() {
+    cat /usr/trim/etc/network_gateway_setting.conf 2>/dev/null | python3 -c '
+import sys, json, re
+text = sys.stdin.read()
+http_port, https_port = "5666", "5667"
+def scan(obj):
+    global http_port, https_port
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if isinstance(v, (int, str)) and str(v).isdigit():
+                if "https" in kl and "port" in kl:
+                    https_port = str(v)
+                elif "http" in kl and "port" in kl:
+                    http_port = str(v)
+            else:
+                scan(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            scan(it)
+if text.strip():
+    try:
+        scan(json.loads(text))
+    except Exception:
+        pass
+    if http_port == "5666":
+        m = re.search(r"\"?http_port\"?\s*[:=]\s*(\d+)", text)
+        if m:
+            http_port = m.group(1)
+    if https_port == "5667":
+        m = re.search(r"\"?https_port\"?\s*[:=]\s*(\d+)", text)
+        if m:
+            https_port = m.group(1)
+print(http_port, https_port)
+' 2>/dev/null || echo "5666 5667"
 }
 
 if [ ! -f "${BASE_DIR}/.env" ]; then
@@ -63,19 +107,47 @@ MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
 QQMUSIC_URL="${FNMUSIC_QQMUSIC_URL:-${QQMUSIC_URL}}"
 LX_SOURCE_URL="${FNMUSIC_LX_SOURCE_URL:-${LX_SOURCE_URL}}"
+LXMUSIC_URL="${FNMUSIC_LX_URL:-${LXMUSIC_URL}}"
 INSTALL_MODE="${FNMUSIC_INSTALL_MODE:-auto}"
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
 ENABLE_QQMUSIC=0
 ENABLE_LX=0
+ENABLE_LXMUSIC=0
 is_enabled "${FNMUSIC_MUSICDL_ENABLED:-true}" && ENABLE_MUSICDL=1
 is_enabled "${FNMUSIC_NETEASE_ENABLED:-true}" && ENABLE_MUSICBOX=1
 is_enabled "${FNMUSIC_QQMUSIC_ENABLED:-false}" && ENABLE_QQMUSIC=1
 is_enabled "${FNMUSIC_LX_SOURCE_ENABLED:-false}" && ENABLE_LX=1
-if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_QQMUSIC}" -eq 0 ]; then
-    log_err "至少需要启用一个可搜索音源（musicdl / musicbox / qqmusic）。"
+is_enabled "${FNMUSIC_LX_ENABLED:-false}" && ENABLE_LXMUSIC=1
+if [ "${ENABLE_MUSICDL}" -eq 0 ] && [ "${ENABLE_MUSICBOX}" -eq 0 ] && [ "${ENABLE_QQMUSIC}" -eq 0 ] && [ "${ENABLE_LXMUSIC}" -eq 0 ]; then
+    log_err "至少需要启用一个可搜索音源（musicdl / musicbox / qqmusic / lxmusic）。"
     exit 1
 fi
+
+run_docker() {
+    if docker info >/dev/null 2>&1; then
+        docker "$@"
+    elif command -v sudo >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
+        sudo docker "$@"
+    else
+        return 1
+    fi
+}
+
+# 容器名全局固定（fnmusic-*）；若被其他副本/并发任务的容器占用，移除后由当前目录接管
+reclaim_container() {
+    local name="$1" owner=""
+    if ! run_docker container inspect "${name}" >/dev/null 2>&1; then
+        return 0
+    fi
+    owner="$(run_docker container inspect "${name}" \
+        --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)"
+    log_info "检测到同名容器 ${name}（来自 ${owner:-未知目录}），移除后由当前目录接管..."
+    if ! run_docker rm -f "${name}"; then
+        log_err "无法移除同名容器 ${name}，请手动执行: docker rm -f ${name}"
+        return 1
+    fi
+}
 
 # ------------------------------------------------------------------------------
 # 回滚函数 (restore 逻辑)
@@ -111,22 +183,32 @@ rollback() {
 verify_acceptance() {
     log_info "==> 执行链路与功能验收..."
 
+    local GW_HTTP_PORT GW_HTTPS_PORT
+    read -r GW_HTTP_PORT GW_HTTPS_PORT <<< "$(get_fnos_gateway_ports)"
+    log_info "fnOS 网关端口: http=${GW_HTTP_PORT} https=${GW_HTTPS_PORT}"
+
     # 6a. 401 快速路径响应与时延测试 (< 3s)
     log_info "验收 6a: 验证未登录 401/99999 快速路径透传 (耗时必须 < 3s)..."
-    local url_5667="https://127.0.0.1:5667/music/api/v1/search/track?keyword=test"
+    local url_https="https://127.0.0.1:${GW_HTTPS_PORT}/music/api/v1/search/track?keyword=test"
     local url_443="https://127.0.0.1/music/api/v1/search/track?keyword=test"
     local resp_file
     resp_file="$(mktemp)"
     local time_total=""
+    local resp_content=""
 
-    time_total="$(curl -sk --max-time 8 -w "%{time_total}" -o "${resp_file}" "${url_5667}" 2>/dev/null || echo "")"
+    # 优先通过 Unix socket 探测
+    time_total="$(curl -s --max-time 8 --unix-socket "${TARGET_SOCK}" -w "%{time_total}" -o "${resp_file}" "http://localhost/music/api/v1/search/track?keyword=test" 2>/dev/null || echo "")"
+    resp_content="$(cat "${resp_file}" 2>/dev/null || true)"
+
     if [ -z "${time_total}" ] || [ ! -s "${resp_file}" ]; then
-        log_warn "5667 端口连接异常，尝试 fallback 访问 443 端口 (302 跳转)..."
-        time_total="$(curl -skL --max-time 8 -w "%{time_total}" -o "${resp_file}" "${url_443}" 2>/dev/null || echo "99")"
+        log_warn "socket 探测异常，尝试 fallback 访问网关 https 端口 (${GW_HTTPS_PORT})..."
+        time_total="$(curl -sk --max-time 8 -w "%{time_total}" -o "${resp_file}" "${url_https}" 2>/dev/null || echo "")"
+        if [ -z "${time_total}" ] || [ ! -s "${resp_file}" ]; then
+            log_warn "网关 https 端口连接异常，尝试 fallback 访问 443 端口 (302 跳转)..."
+            time_total="$(curl -skL --max-time 8 -w "%{time_total}" -o "${resp_file}" "${url_443}" 2>/dev/null || echo "99")"
+        fi
+        resp_content="$(cat "${resp_file}" 2>/dev/null || true)"
     fi
-
-    local resp_content
-    resp_content="$(cat "${resp_file}")"
     rm -f "${resp_file}"
 
     if ! echo "${resp_content}" | grep -q 'INVALID TOKEN\|"code":99999\|code:99999'; then
@@ -267,7 +349,7 @@ except Exception:
 # ------------------------------------------------------------------------------
 # 1. 预检
 # ------------------------------------------------------------------------------
-log_info "==> 步骤 1/5: 环境预检..."
+log_info "==> 步骤 1/5: 环境预检... (fnmusic-ext v${FNMUSIC_VERSION})"
 
 # 1.1 检查 Python 3 与 venv 模块
 if ! command -v python3 >/dev/null 2>&1; then
@@ -378,6 +460,10 @@ if [ "${ENABLE_MUSICDL}" -eq 1 ]; then
     fi
 fi
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
+    mkdir -p "${BASE_DIR}/musicbox-data/cache/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/config/netease-musicbox" \
+        "${BASE_DIR}/musicbox-data/netease-musicbox"
+    chmod -R 777 "${BASE_DIR}/musicbox-data" 2>/dev/null || true
     if ! ensure_source "musicbox" "${MUSICBOX_URL}" "musicbox" "fnmusic-musicbox.service"; then
         exit 1
     fi
@@ -387,6 +473,9 @@ if [ "${ENABLE_QQMUSIC}" -eq 1 ]; then
 fi
 if [ "${ENABLE_LX}" -eq 1 ]; then
     ensure_source "lx-source" "${LX_SOURCE_URL}" "lx-source" "fnmusic-lx-source.service" "/healthz" || exit 1
+fi
+if [ "${ENABLE_LXMUSIC}" -eq 1 ]; then
+    ensure_source "lxmusic" "${LXMUSIC_URL}" "lxmusic" "fnmusic-lxmusic.service" "/healthz" || exit 1
 fi
 
 # 1.5 检查 Python 虚拟环境与依赖
@@ -407,7 +496,9 @@ bash -n "${BASE_DIR}/proxy/run_proxy.sh"
 log_info "==> 步骤 2/5: 幂等性检查..."
 HEALTH_CHECK="$(curl -s --max-time 3 --unix-socket "${TARGET_SOCK}" http://localhost/_ext/healthz 2>/dev/null || true)"
 
-if echo "${HEALTH_CHECK}" | grep -q '"upstream":[[:space:]]*"ok"'; then
+if [ "${FORCE_RELOAD}" -eq 1 ]; then
+    log_info "已指定 --force：跳过幂等提前退出，将重写 unit 并重启代理以加载最新 .env。"
+elif echo "${HEALTH_CHECK}" | grep -q '"upstream":[[:space:]]*"ok"'; then
     log_info "检测到代理服务已在运行且上游健康 (处于扩展接管态)。"
     log_info "直接运行验收测试确认状态..."
     if verify_acceptance; then
@@ -435,7 +526,7 @@ Type=simple
 User=root
 WorkingDirectory=${BASE_DIR}
 ExecStart=${BASE_DIR}/proxy/run_proxy.sh
-ExecStartPost=/bin/sh -c 'for i in \$(seq 1 30); do [ -S /var/run/trim_music.socket ] && chmod 666 /var/run/trim_music.socket && exit 0; sleep 1; done; exit 1'
+ExecStartPost=/bin/sh -c 'for i in \$(seq 1 65); do [ -S /var/run/trim_music.socket ] && chmod 666 /var/run/trim_music.socket && exit 0; sleep 1; done; exit 1'
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -487,7 +578,7 @@ if ! verify_acceptance; then
 fi
 
 log_info "============================================================"
-log_info "fnmusic-ext 扩展已成功部署并生效！"
+log_info "fnmusic-ext v${FNMUSIC_VERSION} 扩展已成功部署并生效！"
 log_info "架构：Unix Socket 接管 (零侵入，不修改 nginx 配置)"
 log_info "在线音源搜索合并、在线播放与元数据代理已就绪。"
 log_info "------------------------------------------------------------"
@@ -497,8 +588,11 @@ log_info "   打开飞牛音乐 Web 端或手机 App，搜索歌曲（如“晴�
 log_info "   点击在线源歌曲试听，确认可以流畅播放并显示歌词与封面。"
 if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
     log_info "2. 网易云扫码登录（可选）："
-    log_info "   若遇到部分网易云 VIP/无损歌曲需登录，可访问："
-    log_info "   http://<NAS_IP>:8770/api/v1/auth/login/qr.png 使用网易云 App 扫码登录。"
+    log_info "   若遇到部分网易云 VIP/无损歌曲需登录："
+    log_info "   • 命令行终端直接扫码: curl -s http://127.0.0.1:8770/api/v1/auth/login/qr"
+    log_info "     （或执行 ./extend.sh --qr 快速显示）"
+    log_info "   • 浏览器图片扫码: http://<NAS_IP>:8770/api/v1/auth/login/qr.png"
+    log_info "   • 查询登录状态: curl -s http://127.0.0.1:8770/api/v1/auth/status"
 fi
 if [ "${ENABLE_QQMUSIC}" -eq 1 ] || [ "${ENABLE_LX}" -eq 1 ]; then
     log_info "3. 在线音源设置："

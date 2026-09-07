@@ -9,8 +9,11 @@ from fastapi import FastAPI, HTTPException, Path, Query, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from netease_ext import batch_song_details, song_lyric_pair
-from runner import MusicboxTimeoutError, run_musicbox
+from netease_ext import batch_song_details, filter_playable_song_ids, song_lyric_pair
+import runner
+from runner import MusicboxTimeoutError, ensure_xdg_dirs
+
+ensure_xdg_dirs()
 
 SEARCH_TYPES = {"song", "album", "artist", "playlist"}
 QUALITY_WHITELIST = {"exhigh", "higher", "standard", "lossless", "hires", "jymaster"}
@@ -47,7 +50,7 @@ async def timeout_exception_handler(request, exc: MusicboxTimeoutError):
 
 
 def exec_musicbox(args: list[str], timeout: float = 30.0) -> Any:
-    code, stdout, stderr = run_musicbox(args, timeout=timeout)
+    code, stdout, stderr = runner.run_musicbox(args, timeout=timeout)
     if code != 0:
         raise UpstreamException(exit_code=code, stderr=stderr or stdout or "")
     try:
@@ -97,7 +100,25 @@ def search(
         raise HTTPException(status_code=400, detail="keyword cannot be empty")
     if type not in SEARCH_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid type {type!r}")
-    return exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
+    res = exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
+    if type == "song" and isinstance(res, dict):
+        raw_list = res.get("data")
+        if isinstance(raw_list, list):
+
+            def _song_id(item: dict) -> int:
+                # 畸形数据（非数字 id）一律归零，零不可能命中 playable 集合
+                try:
+                    return int(item.get("song_id") or item.get("id") or 0)
+                except (ValueError, TypeError):
+                    return 0
+
+            song_ids = [sid for it in raw_list if isinstance(it, dict) for sid in [_song_id(it)] if sid]
+            if song_ids:
+                playable = filter_playable_song_ids(song_ids)
+                res["data"] = [it for it in raw_list if isinstance(it, dict) and _song_id(it) in playable]
+            else:
+                res["data"] = []
+    return res
 
 
 @app.get("/api/v1/song/{song_id}/url")
@@ -169,6 +190,7 @@ def auth_login_check(unikey: str = Query(...)):
 
 
 @app.get("/api/v1/auth/login/qr.png")
+@app.get("/api/v1/auth/qr.png")
 def auth_login_qr():
     try:
         import qrcode
@@ -189,3 +211,35 @@ def auth_login_qr():
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+@app.get("/api/v1/auth/login/qr", response_class=Response)
+@app.get("/api/v1/auth/qr", response_class=Response)
+def auth_login_qr_text():
+    data = exec_musicbox(["auth", "login", "--no-wait", "--json"])
+    payload = _extract_payload(data)
+    qr_ascii = ""
+    unikey = ""
+    if isinstance(payload, dict):
+        qr_ascii = str(payload.get("qr_ascii") or "")
+        unikey = str(payload.get("unikey") or payload.get("codekey") or "")
+    if not qr_ascii:
+        if not unikey:
+            raise UpstreamException(0, "Missing unikey or qr_ascii in auth login response")
+        qr_url = f"https://music.163.com/login?codekey={unikey}"
+        try:
+            import qrcode
+
+            qr = qrcode.QRCode()
+            qr.add_data(qr_url)
+            qr.make(fit=True)
+            f = io.StringIO()
+            qr.print_ascii(out=f)
+            qr_ascii = f.getvalue()
+        except ImportError as exc:
+            raise HTTPException(status_code=501, detail="qrcode extra not installed") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to render QR ascii: {exc}") from exc
+    if not qr_ascii.endswith("\n"):
+        qr_ascii += "\n"
+    return Response(content=qr_ascii, media_type="text/plain; charset=utf-8")

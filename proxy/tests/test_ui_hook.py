@@ -42,6 +42,7 @@ def test_extension_assets_include_mobile_layout_and_safe_areas():
     assert "lastObservedGuid" in script
     assert "本地音乐" in script
     assert "尚未识别当前歌曲" in script
-    assert "lx:'洛雪音乐源'" in script
-    assert "洛雪音乐源优先" in script
+    assert "lxmusic:'洛雪聚合'" in script
+    assert "lx:'洛雪自定义源'" in script
+    assert "洛雪聚合优先" in script
     assert "z-index:100002" in script

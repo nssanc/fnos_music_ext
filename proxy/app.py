@@ -34,10 +34,12 @@ try:
     from . import recommend as dailyrec
     from .online_sources import extract_qq_tracks, lx_music_info, lx_source_key, qq_play_url
     from .source_registry import SourceRegistry
+    from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     from online_sources import extract_qq_tracks, lx_music_info, lx_source_key, qq_play_url  # type: ignore
     from source_registry import SourceRegistry  # type: ignore
+    from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -50,11 +52,15 @@ CONF = {
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
     "qqmusic_url": os.environ.get("FNMUSIC_QQMUSIC_URL", "http://127.0.0.1:8771"),
     "lx_source_url": os.environ.get("FNMUSIC_LX_SOURCE_URL", "http://127.0.0.1:8772"),
+    "lx_url": os.environ.get("FNMUSIC_LX_URL", "http://127.0.0.1:8773"),
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "true").lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "qqmusic_enabled": os.environ.get("FNMUSIC_QQMUSIC_ENABLED", "false").lower() in ("true", "1", "yes"),
     "lx_source_enabled": os.environ.get("FNMUSIC_LX_SOURCE_ENABLED", "false").lower() in ("true", "1", "yes"),
-    "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "2.5")),
+    "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "50")),
+    "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
+    "netease_wait_s": float(os.environ.get("FNMUSIC_NETEASE_WAIT_S", "3.0")),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "100")),
     "musicdl_search_limit": int(os.environ.get("FNMUSIC_MUSICDL_SEARCH_LIMIT", "100")),
@@ -73,8 +79,8 @@ CONF = {
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
-    "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "300")),
-    "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5")),
+    "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
+    "late_page_wait_s": float(os.environ.get("FNMUSIC_LATE_PAGE_WAIT_S", "5.0")),
     "fav_dir": os.environ.get(
         "FNMUSIC_FAV_DIR", os.path.join(_HOME, "online_favorites")
     ),
@@ -89,6 +95,7 @@ SOURCE_REGISTRY = SourceRegistry(
         "netease": CONF["netease_enabled"],
         "qqmusic": CONF["qqmusic_enabled"],
         "lx": CONF["lx_source_enabled"],
+        "lxmusic": CONF["lx_enabled"],
     },
 )
 
@@ -102,6 +109,7 @@ def source_enabled(source_id: str) -> bool:
         "netease": "netease_enabled",
         "qqmusic": "qqmusic_enabled",
         "lx": "lx_source_enabled",
+        "lxmusic": "lx_enabled",
     }.get(source_id)
     return bool(CONF.get(conf_key, False)) if conf_key else False
 
@@ -113,7 +121,8 @@ SOURCE_LABELS = {
     "kuwo": "酷我",
     "migu": "咪咕",
     "kugou": "酷狗",
-    "lx": "洛雪",
+    "lx": "洛雪聚合",
+    "lxsource": "洛雪自定义源",
     "musicdl": "聚合源",
 }
 
@@ -122,6 +131,8 @@ def source_family(source_id: str) -> str:
     source_id = (source_id or "").lower()
     if source_id == "qq":
         return "qqmusic"
+    if source_id == "lx":
+        return "lxmusic"
     if source_id in ("kuwo", "migu", "kugou", "musicdl"):
         return "musicdl"
     return source_id
@@ -204,8 +215,13 @@ _COVER_CACHE: dict[str, dict] = {}
 
 
 def _clean_search_cache() -> None:
-    """写入时若 len(_SEARCH_CACHE) > 200，按 ts 升序砍掉最旧一半。"""
-    if len(_SEARCH_CACHE) > 200:
+    """清理过期缓存，若仍超过容量上限（2000条），按 ts 升序淘汰最旧的一半。"""
+    now = time.time()
+    ttl = CONF.get("search_cache_ttl", 604800.0)
+    expired_keys = [k for k, v in _SEARCH_CACHE.items() if now - v.get("ts", 0) >= ttl]
+    for k in expired_keys:
+        _SEARCH_CACHE.pop(k, None)
+    if len(_SEARCH_CACHE) > 2000:
         sorted_keys = sorted(_SEARCH_CACHE.keys(), key=lambda k: _SEARCH_CACHE[k].get("ts", 0))
         to_remove = sorted_keys[: len(sorted_keys) // 2]
         for k in to_remove:
@@ -236,11 +252,62 @@ def _set_online_entity_cache(guid: str, entry: dict) -> None:
     _ONLINE_ENTITY_CACHE[guid] = entry
 
 
+ONLINE_TRIAL_MARKERS = (
+    "(试听)", "（试听）", "试听片段", "片段试听", "试听版",
+    "[试听]", "【试听】", "- 试听", " - 试听",
+)
+
+
+def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
+    """Reject explicit trials, paid-only records and invalid direct URLs."""
+    if not isinstance(item, dict):
+        return False
+    title = str(item.get("title") or item.get("name") or item.get("song_name") or "").strip()
+    if not title:
+        return False
+    if require_id and not str(
+        item.get("id") or item.get("song_id") or item.get("guid") or ""
+    ).strip():
+        return False
+    if any(marker in title for marker in ONLINE_TRIAL_MARKERS):
+        return False
+    if item.get("is_trial") is True or item.get("freeTrialInfo") or item.get("freeTrialPrivilege"):
+        return False
+
+    def _number(key: str) -> int:
+        try:
+            return int(item.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if _number("is_free_part") != 0 or _number("fail_process") == 4:
+        return False
+    if _number("pay_type") != 0 or _number("pkg_price") != 0 or _number("price") != 0:
+        return False
+    if item.get("fee") is not None and _number("fee") not in (0, 8):
+        return False
+    if item.get("unplayable") is True or item.get("playable") is False:
+        return False
+    if item.get("has_stream") is False:
+        return False
+    if "download_url" in item:
+        url = str(item.get("download_url") or "").strip()
+        if not url.startswith(("http://", "https://")) or "error.html" in url:
+            return False
+    if "url" in item:
+        url = str(item.get("url") or "").strip()
+        if not url or "error.html" in url:
+            return False
+    return True
+
+
 def deduplicate_online_items(items: list[dict]) -> list[dict]:
     """同一音源内去重；跨音源同名歌曲保留，便于用户切换版本。"""
     seen = set()
     res = []
     for it in items:
+        if not is_playable_online_track(it):
+            continue
         t = str(it.get("title") or it.get("name") or "").strip().lower()
         a = str(it.get("artist") or "").strip().lower()
         if t and a:
@@ -1167,6 +1234,14 @@ async def fetch_preferred_lyric(request: Request, guid: str, provider: str) -> s
         elif provider == "lx":
             result = await resolve_lx_action(request, guid, info, action="lyric")
             return normalize_timed_lyric(result)
+        elif provider == "lxmusic":
+            items = await fetch_lx_search(get_lx_client(request.app), keyword, 10) or []
+            match = _pick_lyric_match(items, title, artist)
+            if match:
+                matched_guid = online_guid_from_item(match)
+                _set_online_entity_cache(matched_guid, {**match, "ts": time.time()})
+                detail = await _online_info(request, matched_guid) or match
+                return normalize_timed_lyric(detail.get("lyric") or detail.get("lyrics"))
     except Exception as exc:
         logger.warning("preferred lyric source %s failed for %s: %s", provider, guid, exc)
     return ""
@@ -1205,7 +1280,13 @@ async def resolve_online_lyric(request: Request, guid: str) -> str:
                     if isinstance(l_data, dict):
                         lyric_text = normalize_timed_lyric(l_data.get("lyric"))
                         if lyric_text:
-                            write_lyric_cache(guid, lyric_text)
+                            info = await _online_info(request, guid)
+                            write_lyric_cache(
+                                guid,
+                                lyric_text,
+                                title=str((info or {}).get("title") or ""),
+                                artist=str((info or {}).get("artist") or ""),
+                            )
                             return lyric_text
         except Exception as e:
             logger.warning("musicbox lyric fetch failed for %s: %s", guid, e)
@@ -1423,6 +1504,15 @@ def get_lx_source_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+def get_lx_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    """Client for the searchable LX aggregation service (not the JS runner)."""
+    client = getattr(fastapi_app.state, "lx_client", None)
+    if client is None:
+        client = httpx.AsyncClient(base_url=CONF["lx_url"], timeout=25.0)
+        fastapi_app.state.lx_client = client
+    return client
+
+
 def get_cover_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     client = getattr(fastapi_app.state, "cover_client", None)
     if client is None:
@@ -1559,6 +1649,9 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
             if isinstance(data, dict):
                 if data.get("errors"):
                     logger.warning("musicdl search partial errors: %s", data.get("errors"))
+                raw_items = data.get("items")
+                if isinstance(raw_items, list):
+                    data["items"] = [it for it in raw_items if is_playable_online_track(it)]
                 return data
     except Exception as e:
         logger.warning("Failed to fetch online search from musicdl: %s", e)
@@ -1680,6 +1773,8 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
         for it in raw_list:
             if not isinstance(it, dict):
                 continue
+            if not is_playable_online_track(it):
+                continue
             sid = str(it.get("song_id") or it.get("id") or "")
             if not sid:
                 continue
@@ -1736,7 +1831,7 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
             except Exception as detail_err:
                 logger.warning("Failed to fetch songs detail for %s: %s", keyword, detail_err)
 
-        return items
+        return [it for it in items if is_playable_online_track(it)]
     except Exception as e:
         logger.warning("Failed to fetch musicbox search: %s", e)
         return None
@@ -1906,6 +2001,86 @@ async def load_online_entity_bundle(request: Request, guid: str) -> dict | None:
     return bundle
 
 
+async def fetch_lx_search(
+    client: httpx.AsyncClient, keyword: str, limit: int
+) -> list[dict] | None:
+    """Search the standalone LX aggregation service."""
+    if not keyword:
+        return None
+    timeout = max(float(CONF.get("search_timeout") or 25), 8.0)
+    try:
+        response = await client.get(
+            "/api/v1/search",
+            params={"keyword": keyword, "limit": limit},
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        raw_items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(raw_items, list) or payload.get("ok") is False:
+            return None
+        items: list[dict] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict) or not is_playable_online_track(raw):
+                continue
+            track_id = str(raw.get("id") or "")
+            if not track_id:
+                continue
+            try:
+                duration_s = float(raw.get("duration_s") or 0)
+            except (TypeError, ValueError):
+                duration_s = 0.0
+            try:
+                file_size = int(raw.get("file_size") or 0)
+            except (TypeError, ValueError):
+                file_size = 0
+            items.append({
+                "id": track_id,
+                "source": "lx",
+                "lx_source": str(raw.get("lx_source") or ""),
+                "title": str(raw.get("title") or raw.get("name") or ""),
+                "artist": str(raw.get("artist") or ""),
+                "album": str(raw.get("album") or ""),
+                "duration_s": duration_s,
+                "ext": str(raw.get("ext") or "mp3") or "mp3",
+                "cover_url": str(raw.get("cover_url") or ""),
+                "file_size": file_size,
+                "lyric": "",
+            })
+        return [item for item in items if is_playable_online_track(item)]
+    except Exception as exc:
+        logger.warning("Failed to fetch online search from lxmusic: %s", exc)
+        return None
+
+
+async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> dict | None:
+    """Resolve an LX aggregation ID such as ``lx:kg:<hash>``."""
+    qualities: list[str] = []
+    primary = str(CONF.get("lx_quality") or "lossless").strip()
+    if primary:
+        qualities.append(primary)
+    for fallback in ("high", "standard"):
+        if fallback not in qualities:
+            qualities.append(fallback)
+    for quality in qualities:
+        try:
+            response = await client.get(
+                "/api/v1/track/url",
+                params={"id": song_id, "quality": quality},
+                timeout=15.0,
+            )
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if payload.get("ok") is not False and isinstance(data, dict) and data.get("url"):
+                return data
+        except Exception as exc:
+            logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, quality, exc)
+    return None
+
+
 async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | None:
     qualities = []
     primary = str(CONF.get("netease_quality") or "lossless").strip()
@@ -1980,6 +2155,8 @@ def merge_online_tracks(
 
     filtered_online = []
     for online_item in raw_items:
+        if not is_playable_online_track(online_item, require_id=True):
+            continue
         ot = str(online_item.get("title") or online_item.get("name") or "").strip().lower()
         oa = str(online_item.get("artist") or "").strip().lower()
         if ot and oa and (ot, oa) in existing_keys:
@@ -2151,7 +2328,7 @@ def _conf_log_value(key: str, value: Any) -> Any:
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
-    logger.info("=== fnmusic-ext configuration ===")
+    logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
@@ -2162,6 +2339,7 @@ async def lifespan(fastapi_app: FastAPI):
     created_musicbox = False
     created_qqmusic = False
     created_lx_source = False
+    created_lx = False
     created_llm = False
     created_cover = False
 
@@ -2199,6 +2377,12 @@ async def lifespan(fastapi_app: FastAPI):
         )
         created_lx_source = True
 
+    if getattr(fastapi_app.state, "lx_client", None) is None:
+        fastapi_app.state.lx_client = httpx.AsyncClient(
+            base_url=CONF["lx_url"], timeout=25.0
+        )
+        created_lx = True
+
     if getattr(fastapi_app.state, "llm_client", None) is None:
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
@@ -2225,6 +2409,9 @@ async def lifespan(fastapi_app: FastAPI):
         if created_lx_source and getattr(fastapi_app.state, "lx_source_client", None):
             await fastapi_app.state.lx_source_client.aclose()
             fastapi_app.state.lx_source_client = None
+        if created_lx and getattr(fastapi_app.state, "lx_client", None):
+            await fastapi_app.state.lx_client.aclose()
+            fastapi_app.state.lx_client = None
         if created_llm and getattr(fastapi_app.state, "llm_client", None):
             await fastapi_app.state.llm_client.aclose()
             fastapi_app.state.llm_client = None
@@ -2324,6 +2511,7 @@ async def ext_sources(request: Request):
         "netease": (get_musicbox_client(request.app), "/healthz"),
         "qqmusic": (get_qqmusic_client(request.app), "/health"),
         "lx": (get_lx_source_client(request.app), "/healthz"),
+        "lxmusic": (get_lx_client(request.app), "/healthz"),
     }
     statuses = await asyncio.gather(*(_service_status(*clients[key]) for key in clients))
     status_map = dict(zip(clients, statuses))
@@ -2332,6 +2520,7 @@ async def ext_sources(request: Request):
         "netease": "网易云搜索、歌词与高品质播放",
         "qqmusic": "QQ 搜索及登录账号的会员音质",
         "lx": "用已导入的洛雪脚本补充播放地址",
+        "lxmusic": "洛雪聚合搜索、歌词与免登录播放解析",
     }
     builtins = [
         {
@@ -2375,8 +2564,8 @@ async def ext_source_preferences(request: Request):
     await require_ext_access(request, mutation=True)
     body = await request.json()
     allowed = {
-        "audioSource": {"auto", "qqmusic", "netease", "musicdl", "lx"},
-        "lyricSource": {"auto", "same", "qqmusic", "netease", "musicdl", "lx"},
+        "audioSource": {"auto", "qqmusic", "netease", "musicdl", "lx", "lxmusic"},
+        "lyricSource": {"auto", "same", "qqmusic", "netease", "musicdl", "lx", "lxmusic"},
     }
     if not isinstance(body, dict) or not body:
         raise HTTPException(status_code=400, detail="preference is required")
@@ -2401,7 +2590,7 @@ async def ext_resolve_track_source(request: Request):
         raise HTTPException(status_code=400, detail="invalid request")
     guid = str(body.get("guid") or "").strip()
     provider = str(body.get("source") or "").strip().lower()
-    if provider not in {"qqmusic", "netease", "musicdl", "lx"}:
+    if provider not in {"qqmusic", "netease", "musicdl", "lx", "lxmusic"}:
         raise HTTPException(status_code=400, detail="invalid source")
     if not source_enabled(provider):
         raise HTTPException(status_code=400, detail="该音乐源未启用")
@@ -2493,7 +2682,7 @@ async def ext_resolve_track_source(request: Request):
         lx_item = {
             **origin,
             "id": token,
-            "source": "lx",
+            "source": "lxsource",
             "title": title,
             "artist": artist,
             "play_url": play_url,
@@ -2508,7 +2697,7 @@ async def ext_resolve_track_source(request: Request):
             "track": track,
             "streamUrl": f"/music/api/v1/track/stream?guid={quote(track['guid'], safe='')}",
             "source": "lx",
-            "sourceName": source_label("lx"),
+            "sourceName": source_label("lxsource"),
         }
 
     tracks = await search_source_tracks(request, provider, keyword, 12)
@@ -2617,12 +2806,14 @@ async def ext_healthz(request: Request):
     musicbox_client = get_musicbox_client(request.app)
     qqmusic_client = get_qqmusic_client(request.app)
     lx_source_client = get_lx_source_client(request.app)
+    lx_client = get_lx_client(request.app)
 
     upstream_status = "fail"
     musicdl_status = "fail"
     musicbox_status = "fail"
     qqmusic_status = "fail"
     lx_source_status = "fail"
+    lxmusic_status = "fail"
 
     try:
         r = await upstream_client.get("/music/api/v1/search/track?keyword=healthz_probe", timeout=2.0)
@@ -2671,16 +2862,31 @@ async def ext_healthz(request: Request):
         except Exception as e:
             logger.debug("LX source health check failed: %s", e)
 
+    if not source_enabled("lxmusic"):
+        lxmusic_status = "disabled"
+    else:
+        try:
+            r = await lx_client.get("/healthz", timeout=2.0)
+            if r.status_code == 200:
+                lxmusic_status = "ok"
+        except Exception as e:
+            logger.debug("LX aggregation health check failed: %s", e)
+
     llm_status = "enabled" if dailyrec.llm_enabled() else "disabled"
-    source_ok = any(status == "ok" for status in (musicdl_status, musicbox_status, qqmusic_status))
+    source_ok = any(
+        status == "ok"
+        for status in (musicdl_status, musicbox_status, qqmusic_status, lxmusic_status)
+    )
 
     return {
         "ok": upstream_status == "ok" and source_ok,
+        "version": get_version(),
         "upstream": upstream_status,
         "musicdl": musicdl_status,
         "musicbox": musicbox_status,
         "qqmusic": qqmusic_status,
         "lx_source": lx_source_status,
+        "lxmusic": lxmusic_status,
         "llm": llm_status,
     }
 
@@ -2762,93 +2968,74 @@ async def search_track(request: Request):
         online_all = cached_entry.get("items", [])
     else:
         entry: dict[str, Any] = {"items": [], "ts": time.time(), "task": None}
-        mb_task: asyncio.Task | None = None
-        mdl_task: asyncio.Task | None = None
-        qq_task: asyncio.Task | None = None
+        tasks: dict[str, asyncio.Task] = {}
         if source_enabled("netease"):
-            mb_task = asyncio.create_task(
+            tasks["netease"] = asyncio.create_task(
                 fetch_musicbox_search(musicbox_client, keyword, CONF["netease_search_limit"])
             )
         if source_enabled("musicdl"):
-            mdl_task = asyncio.create_task(
+            tasks["musicdl"] = asyncio.create_task(
                 fetch_musicdl_search(musicdl_client, keyword, CONF["musicdl_search_limit"])
             )
         if source_enabled("qqmusic"):
-            qq_task = asyncio.create_task(
+            tasks["qqmusic"] = asyncio.create_task(
                 fetch_qqmusic_search(qqmusic_client, keyword, CONF["qqmusic_search_limit"])
             )
-
-        async def _bg_aggregator(
-            e: dict,
-            t_mb: asyncio.Task | None,
-            t_mdl: asyncio.Task | None,
-            t_qq: asyncio.Task | None,
-        ):
-            mb_res = None
-            mdl_res = None
-            qq_res = None
-            if t_mb:
-                try:
-                    mb_res = await t_mb
-                except Exception as exc:
-                    logger.warning("musicbox search bg failed: %s", exc)
-            if t_mdl:
-                try:
-                    mdl_res = await t_mdl
-                except Exception as exc:
-                    logger.warning("musicdl search bg failed: %s", exc)
-            if t_qq:
-                try:
-                    qq_res = await t_qq
-                except Exception as exc:
-                    logger.warning("QQ Music search bg failed: %s", exc)
-            mb_list = mb_res if isinstance(mb_res, list) else []
-            mdl_list = (
-                mdl_res.get("items", [])
-                if isinstance(mdl_res, dict) and isinstance(mdl_res.get("items"), list)
-                else []
-            )
-            qq_list = qq_res if isinstance(qq_res, list) else []
-            e["items"] = order_online_items(
-                deduplicate_online_items(qq_list + mb_list + mdl_list)
+        if source_enabled("lxmusic"):
+            tasks["lxmusic"] = asyncio.create_task(
+                fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"])
             )
 
-        agg_task = asyncio.create_task(_bg_aggregator(entry, mb_task, mdl_task, qq_task))
+        def _collect_source_items(results: list[Any]) -> list[dict]:
+            merged_items: list[dict] = []
+            for result in results:
+                if isinstance(result, dict) and isinstance(result.get("items"), list):
+                    merged_items.extend(result["items"])
+                elif isinstance(result, list):
+                    merged_items.extend(item for item in result if isinstance(item, dict))
+            return order_online_items(deduplicate_online_items(merged_items))
+
+        async def _bg_aggregator(e: dict) -> None:
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for name, result in zip(tasks, results):
+                if isinstance(result, Exception):
+                    logger.warning("%s search bg failed: %s", name, result)
+            e["items"] = _collect_source_items(results)
+
+        agg_task = asyncio.create_task(_bg_aggregator(entry))
         entry["task"] = agg_task
         _set_search_cache(keyword, entry)
 
-        if page == 1:
-            fast_tasks = [task for task in (qq_task, mb_task) if task is not None]
-            if fast_tasks:
-                try:
-                    done, _ = await asyncio.wait(
-                        fast_tasks, timeout=float(CONF["netease_wait_s"])
-                    )
-                    quick_items = []
-                    for task in fast_tasks:
-                        if task in done and not task.cancelled() and task.exception() is None:
-                            result = task.result()
-                            if isinstance(result, list):
-                                quick_items.extend(result)
-                    if quick_items and not agg_task.done():
-                        entry["items"] = order_online_items(deduplicate_online_items(quick_items))
-                except Exception:
-                    pass
-            elif mdl_task:
-                try:
-                    mdl_res = await asyncio.wait_for(
-                        asyncio.shield(mdl_task), timeout=min(float(CONF["search_timeout"]), 4.0)
-                    )
-                    if isinstance(mdl_res, dict) and not agg_task.done():
-                        entry["items"] = order_online_items(
-                            deduplicate_online_items(mdl_res.get("items") or [])
-                        )
-                except Exception:
-                    pass
-        else:
+        if page == 1 and tasks:
+            wait_budget = float(CONF.get("netease_wait_s", 3.0))
+            done, pending = await asyncio.wait(
+                list(tasks.values()), timeout=wait_budget, return_when=asyncio.ALL_COMPLETED
+            )
+            if done and not agg_task.done():
+                completed = []
+                for task in done:
+                    if not task.cancelled() and task.exception() is None:
+                        completed.append(task.result())
+                entry["items"] = _collect_source_items(completed)
+            if not done and pending:
+                late_done, _ = await asyncio.wait(
+                    pending,
+                    timeout=float(CONF.get("late_page_wait_s", 5.0)),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if late_done and not agg_task.done():
+                    completed = [
+                        task.result()
+                        for task in late_done
+                        if not task.cancelled() and task.exception() is None
+                    ]
+                    entry["items"] = _collect_source_items(completed)
+        elif page >= 2:
             try:
-                await asyncio.wait_for(asyncio.shield(agg_task), timeout=CONF["late_page_wait_s"])
-            except Exception:
+                await asyncio.wait_for(
+                    asyncio.shield(agg_task), timeout=CONF["late_page_wait_s"]
+                )
+            except (asyncio.TimeoutError, Exception):
                 pass
 
         online_all = entry.get("items", [])
@@ -3155,6 +3342,8 @@ def stream_tee_response(
                         adopt_library_perms(dest)
                         remember_media_path(guid, dest)
                         write_audio_tags(dest, title=title, artist=artist, album=album)
+                        if lyric.strip():
+                            write_lyric_cache(guid, lyric, title=title, artist=artist)
                     except Exception as e:
                         logger.warning("Failed to rename cache file: %s", e)
                         if os.path.exists(part_path):
@@ -3462,7 +3651,7 @@ async def stream_track(request: Request, subpath: str = ""):
                 str(info.get("ext") or "flac"),
                 allow_full_fallback=False,
             )
-    if src == "lx":
+    if src == "lxsource":
         info = cached_info or {}
         play_url = str(info.get("play_url") or "")
         if not play_url.startswith(("http://", "https://")):
@@ -3531,6 +3720,70 @@ async def stream_track(request: Request, subpath: str = ""):
 
         return await stream_direct_online(
             request, guid, play_url, range_header, info if isinstance(info, dict) else None, resolved_ext
+        )
+
+    if src == "lx":
+        lx_client = get_lx_client(request.app)
+        song_id = song_id_from_online_guid(guid)
+
+        url_res, info_res = await asyncio.gather(
+            resolve_lx_url(lx_client, song_id),
+            _online_info(request, guid),
+            return_exceptions=True,
+        )
+        url_info = None if isinstance(url_res, Exception) else url_res
+        info = None if isinstance(info_res, Exception) else info_res
+
+        play_url = str((url_info or {}).get("url") or "") if url_info else ""
+        if not play_url:
+            return JSONResponse(
+                content={"code": 404, "msg": "online source unavailable", "data": None},
+                status_code=404,
+            )
+
+        resolved_ext = (
+            str(url_info.get("ext"))
+            if url_info.get("ext")
+            else (str(info.get("ext")) if (isinstance(info, dict) and info.get("ext")) else None)
+        )
+
+        req_headers = {}
+        url_req_headers = {str(k).lower(): str(v) for k, v in (url_info.get("headers") or {}).items()}
+        for hdr_key in ("user-agent", "referer"):
+            hdr_val = url_req_headers.get(hdr_key, "")
+            if hdr_val:
+                req_headers[hdr_key] = hdr_val
+        if range_header:
+            req_headers["Range"] = range_header
+
+        stream_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        try:
+            stream_req = stream_client.build_request("GET", play_url, headers=req_headers)
+            resp = await stream_client.send(stream_req, stream=True)
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if resp.status_code >= 400 or "text/html" in content_type:
+                await resp.aclose()
+                await stream_client.aclose()
+                return JSONResponse(
+                    content={"code": 404, "msg": "online source unavailable", "data": None},
+                    status_code=404,
+                )
+        except Exception as e:
+            logger.warning("Failed to stream lx url %s for %s: %s", play_url, guid, e)
+            await stream_client.aclose()
+            return JSONResponse(
+                content={"code": 404, "msg": "online source unavailable", "data": None},
+                status_code=404,
+            )
+
+        return stream_tee_response(
+            resp,
+            guid=guid,
+            range_header=range_header,
+            coro_factory=None if info is not None else (lambda: _online_info(request, guid)),
+            client_to_close=stream_client,
+            resolved_ext=resolved_ext,
+            pre_info=info if isinstance(info, dict) else None,
         )
 
     musicdl_client = get_musicdl_client(request.app)
@@ -3737,6 +3990,47 @@ async def _online_info(request: Request, guid: str) -> dict | None:
             logger.warning("musicbox /info failed for %s: %s", guid, e)
         return None
 
+    if src == "lx":
+        lx_client = get_lx_client(request.app)
+        song_id = song_id_from_online_guid(guid)
+        try:
+            r = await lx_client.get("/api/v1/track/info", params={"id": song_id}, timeout=10.0)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and data.get("ok") is not False:
+                    inner = data.get("data")
+                    if isinstance(inner, dict):
+                        lyric_text = ""
+                        if not inner.get("lyric"):
+                            try:
+                                lr = await lx_client.get(
+                                    "/api/v1/track/lyric", params={"id": song_id}, timeout=10.0
+                                )
+                                if lr.status_code == 200:
+                                    l_res = lr.json()
+                                    if isinstance(l_res, dict) and l_res.get("ok") is not False:
+                                        lyric_text = str((l_res.get("data") or {}).get("lyric") or "").strip()
+                            except Exception as l_err:
+                                logger.warning("lxmusic lyric fetch failed for %s: %s", guid, l_err)
+                        else:
+                            lyric_text = str(inner.get("lyric") or "").strip()
+                        return {
+                            "id": song_id,
+                            "source": "lx",
+                            "lx_source": str(inner.get("lx_source") or ""),
+                            "title": str(inner.get("title") or ""),
+                            "artist": str(inner.get("artist") or ""),
+                            "album": str(inner.get("album") or ""),
+                            "cover_url": str(inner.get("cover_url") or ""),
+                            "duration_s": float(inner.get("duration_s") or 0),
+                            "ext": str(inner.get("ext") or "mp3") or "mp3",
+                            "file_size": int(inner.get("file_size") or 0),
+                            "lyric": lyric_text,
+                        }
+        except Exception as e:
+            logger.warning("lxmusic /info failed for %s: %s", guid, e)
+        return None
+
     musicdl_client = get_musicdl_client(request.app)
     song_id = song_id_from_online_guid(guid)
     try:
@@ -3855,6 +4149,8 @@ async def search_source_tracks(
     if provider == "musicdl" and source_enabled("musicdl"):
         payload = await fetch_musicdl_search(get_musicdl_client(request.app), keyword, limit) or {}
         return payload.get("items") if isinstance(payload.get("items"), list) else []
+    if provider == "lxmusic" and source_enabled("lxmusic"):
+        return await fetch_lx_search(get_lx_client(request.app), keyword, limit) or []
     return []
 
 
@@ -4346,6 +4642,8 @@ async def _ensure_daily_task(request: Request, user_guid: str) -> asyncio.Task:
             build_track=build_online_track,
             netease_enabled=source_enabled("netease"),
             favorite_items=favs,
+            lx_client=get_lx_client(request.app) if source_enabled("lxmusic") else None,
+            lx_enabled=source_enabled("lxmusic"),
         )
     )
     _DAILY_TASKS[key] = task
