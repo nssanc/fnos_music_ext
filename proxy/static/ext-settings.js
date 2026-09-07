@@ -8,7 +8,7 @@
   }
   const css = `
   #fmx-open{position:fixed;right:22px;bottom:88px;z-index:9000;border:0;border-radius:22px;padding:10px 15px;background:#6d5dfc;color:white;font-weight:650;box-shadow:0 8px 30px #0007;cursor:pointer}
-  #fmx-player-source{position:fixed;right:22px;bottom:38px;z-index:9001;border:1px solid #ffffff28;border-radius:18px;padding:7px 12px;background:#242731;color:#fff;font-size:12px;box-shadow:0 5px 20px #0006;cursor:pointer}#fmx-source-menu{position:fixed;right:22px;bottom:76px;z-index:9002;min-width:170px;padding:7px;background:#20232a;color:#fff;border:1px solid #ffffff24;border-radius:11px;box-shadow:0 12px 38px #000a}#fmx-source-menu button{display:block;width:100%;border:0;border-radius:7px;padding:9px 10px;text-align:left;background:transparent;color:#fff;cursor:pointer}#fmx-source-menu button:hover{background:#ffffff14}#fmx-source-menu button:disabled{opacity:.45;cursor:wait}
+  #fmx-player-source{position:fixed;right:22px;bottom:38px;z-index:100001;border:1px solid #ffffff28;border-radius:18px;padding:7px 12px;background:#242731;color:#fff;font-size:12px;box-shadow:0 5px 20px #0006;cursor:pointer;pointer-events:auto!important;touch-action:manipulation}#fmx-source-menu{position:fixed;right:22px;bottom:76px;z-index:100002;min-width:190px;padding:7px;background:#20232af5;color:#fff;border:1px solid #ffffff24;border-radius:11px;box-shadow:0 12px 38px #000a;pointer-events:auto!important;touch-action:manipulation}#fmx-source-menu button{display:block;width:100%;border:0;border-radius:7px;padding:9px 10px;text-align:left;background:transparent;color:#fff;cursor:pointer;pointer-events:auto!important;touch-action:manipulation}#fmx-source-menu button:hover{background:#ffffff14}#fmx-source-menu button:disabled{opacity:.45;cursor:wait}
   #fmx-overlay{position:fixed;inset:0;z-index:99999;background:#0009;display:flex;align-items:center;justify-content:center;padding:20px}
   .fmx-panel{width:min(840px,96vw);max-height:88vh;overflow:auto;background:#191b20;color:#eee;border:1px solid #ffffff18;border-radius:16px;box-shadow:0 24px 80px #000b;padding:22px;box-sizing:border-box;-webkit-overflow-scrolling:touch}.fmx-head{display:flex;align-items:center;justify-content:space-between}.fmx-head h2{margin:0;font-size:21px}.fmx-x,.fmx-btn{border:0;border-radius:8px;padding:8px 12px;color:#fff;background:#343842;cursor:pointer}.fmx-primary{background:#6d5dfc}.fmx-danger{background:#a53b48}.fmx-muted{color:#a8adb8;font-size:13px}.fmx-card{border:1px solid #ffffff18;background:#22252c;border-radius:12px;padding:14px;margin-top:12px}.fmx-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.fmx-grow{flex:1;min-width:0}.fmx-name{font-weight:650;overflow-wrap:anywhere}.fmx-status{font-size:12px;padding:3px 8px;border-radius:20px;background:#353944}.fmx-ok{background:#174f36;color:#8ff0b9}.fmx-warn{background:#584517;color:#f7d478}.fmx-input,.fmx-textarea{width:100%;box-sizing:border-box;background:#121419;color:#eee;border:1px solid #ffffff28;border-radius:8px;padding:10px;margin-top:8px}.fmx-textarea{min-height:110px;resize:vertical}.fmx-section{margin-top:22px}.fmx-section h3{font-size:16px;margin:0 0 8px}.fmx-qr{width:210px;height:210px;max-width:calc(100vw - 64px);object-fit:contain;background:#fff;border-radius:8px;padding:8px}.fmx-msg{margin-top:10px;color:#efc76e;white-space:pre-wrap;overflow-wrap:anywhere}.fmx-switch{accent-color:#6d5dfc;width:18px;height:18px;flex:0 0 auto}.fmx-hidden{display:none!important}
   @media(max-width:720px){
@@ -36,6 +36,8 @@
   const sourceNames = { musicdl: '酷我 / 咪咕', netease: '网易云音乐', qqmusic: 'QQ 音乐', lx: '洛雪自定义源' };
   let qrTimer = null;
   let switchedTrack = null;
+  let lastObservedGuid = '';
+  let lastMediaElement = null;
 
   function shell() {
     const root = document.createElement('div'); root.id = 'fmx-overlay';
@@ -80,20 +82,24 @@
   }
   function addButton() {
     if (document.querySelector('#fmx-open')) return;
-    const button=document.createElement('button');button.id='fmx-open';button.textContent='在线音源';button.title='在线音源设置';button.setAttribute('aria-label','在线音源设置');button.addEventListener('click',shell);document.body.appendChild(button);
+    const button=document.createElement('button');button.id='fmx-open';button.textContent='在线音源';button.title='在线音源设置';button.setAttribute('aria-label','在线音源设置');button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();const track=currentTrack();if(track.guid)openSourceMenu();else shell();});document.body.appendChild(button);
   }
   function activeAudio() {
     const items=[...document.querySelectorAll('audio')];
-    return items.find(el => /\/music\/api\/v1\/track\/(?:stream|hls)/.test(el.currentSrc || el.src || '')) || items[0] || null;
+    return items.find(el => /\/music\/api\/v1\/track\/(?:stream|hls)/.test(el.currentSrc || el.src || '')) || lastMediaElement || items[0] || null;
   }
   function guidFromUrl(value) {
     try {
-      const url=new URL(value, location.href), query=url.searchParams.get('guid') || url.searchParams.get('trackGUID');
-      if(query?.startsWith('online:')) return query;
-      const match=decodeURIComponent(url.pathname).match(/\/track\/hls\/(online:[^/]+)/);
+      const url=new URL(value, location.href), path=decodeURIComponent(url.pathname), query=url.searchParams.get('guid') || url.searchParams.get('trackGUID');
+      if(query && /\/track\/(?:stream|hls)(?:\/|$)/.test(path)) return query;
+      const match=path.match(/\/track\/(?:stream|hls)\/([^/]+)/);
       return match?.[1] || '';
     } catch (_) { return ''; }
   }
+  function rememberTrackUrl(value) { const guid=guidFromUrl(typeof value==='string'?value:value?.url||''); if(guid)lastObservedGuid=guid; }
+  const nativeFetch=window.fetch.bind(window);window.fetch=(input,init)=>{rememberTrackUrl(input);return nativeFetch(input,init);};
+  const nativeXhrOpen=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url,...rest){rememberTrackUrl(url);return nativeXhrOpen.call(this,method,url,...rest);};
+  document.addEventListener('play',event=>{if(event.target instanceof HTMLMediaElement){lastMediaElement=event.target;rememberTrackUrl(event.target.currentSrc||event.target.src);updatePlayerSource();}},true);
   function currentTrack() {
     const audio=activeAudio();
     let guid=guidFromUrl(audio?.currentSrc || audio?.src || '');
@@ -101,6 +107,8 @@
       const resources=performance.getEntriesByType('resource');
       for(let i=resources.length-1;i>=0 && !guid;i--) guid=guidFromUrl(resources[i].name);
     }
+    if(!guid) guid=lastObservedGuid || switchedTrack?.guid || '';
+    if(guid) lastObservedGuid=guid;
     const meta=navigator.mediaSession?.metadata;
     return {audio,guid,title:meta?.title || switchedTrack?.title || '',artist:meta?.artist || switchedTrack?.artist || ''};
   }
@@ -108,26 +116,28 @@
   async function openSourceMenu() {
     closeSourceMenu();
     const track=currentTrack();
-    if(!track.audio || !track.guid) return;
-    const menu=document.createElement('div'); menu.id='fmx-source-menu'; menu.innerHTML='<div style="padding:7px 10px;color:#a8adb8;font-size:12px">选择当前歌曲的播放源</div>';
+    const menu=document.createElement('div'); menu.id='fmx-source-menu'; menu.innerHTML=`<div style="padding:7px 10px;color:#a8adb8;font-size:12px">${track.guid?'选择当前歌曲的播放源':'尚未识别当前歌曲，请先播放一首歌'}</div>`;
     document.body.appendChild(menu);
+    if(!track.guid) { const settings=document.createElement('button');settings.textContent='打开音源设置';settings.addEventListener('click',()=>{closeSourceMenu();shell();});menu.appendChild(settings);return; }
     try {
       const listing=await api('/sources');
       const labels={qqmusic:'QQ 音乐',netease:'网易云音乐',musicdl:'酷我 / 咪咕'};
       (listing.builtins || []).filter(s => labels[s.id]).forEach(source => {
         const button=document.createElement('button'); button.textContent=`${labels[source.id]}${source.enabled ? '' : '（未启用）'}`; button.disabled=!source.enabled;
-        button.addEventListener('click',()=>switchPlayingSource(source.id,button)); menu.appendChild(button);
+        button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();switchPlayingSource(source.id,button);}); menu.appendChild(button);
       });
+      const settings=document.createElement('button');settings.textContent='管理音源设置…';settings.style.borderTop='1px solid #ffffff18';settings.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();closeSourceMenu();shell();});menu.appendChild(settings);
     } catch(error) { menu.innerHTML=`<div style="padding:10px">加载失败：${esc(error.message)}</div>`; }
   }
   async function switchPlayingSource(source, button) {
     const current=currentTrack(), audio=current.audio;
-    if(!audio) return;
+    if(!audio) { button.disabled=false;button.textContent='未找到播放器，请重新播放后再试';return; }
     button.disabled=true; button.textContent='正在匹配并切换…';
     try {
       const result=await api('/resolve-track-source',{method:'POST',body:JSON.stringify({guid:current.guid,title:current.title,artist:current.artist,source})});
       const paused=audio.paused, position=Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
       switchedTrack={guid:result.track.guid,title:result.track.title,artist:result.track.artist,sourceName:result.sourceName};
+      lastObservedGuid=result.track.guid;
       audio.src=result.streamUrl; audio.load();
       audio.addEventListener('loadedmetadata',()=>{ try { audio.currentTime=Math.min(position,Math.max(0,(audio.duration || position)-.5)); } catch(_){} if(!paused) audio.play().catch(()=>{}); },{once:true});
       closeSourceMenu(); updatePlayerSource();
@@ -137,9 +147,9 @@
     const track=currentTrack(), existing=document.querySelector('#fmx-player-source');
     if(!track.guid) { existing?.remove(); closeSourceMenu(); switchedTrack=null; return; }
     let label=switchedTrack?.guid===track.guid ? switchedTrack.sourceName : '';
-    if(!label) { const src=track.guid.split(':')[1]; label={qq:'QQ 音乐',netease:'网易云',kuwo:'酷我',migu:'咪咕',kugou:'酷狗'}[src] || '在线音源'; }
+    if(!label) { const src=track.guid.startsWith('online:')?track.guid.split(':')[1]:''; label={qq:'QQ 音乐',netease:'网易云',kuwo:'酷我',migu:'咪咕',kugou:'酷狗'}[src] || (src?'在线音源':'本地音乐'); }
     const button=existing || document.createElement('button'); button.id='fmx-player-source'; button.textContent=`来源：${label} ▾`; button.title='点击切换当前歌曲的播放源';
-    if(!existing) { button.addEventListener('click',openSourceMenu); document.body.appendChild(button); }
+    if(!existing) { button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();openSourceMenu();}); document.body.appendChild(button); }
   }
   const mobileNavItems=[['首页','⌂','/music/'],['收藏','♡','/music/favorites'],['最近','◷','/music/recent'],['搜索','⌕','/music/search']];
   function closeMobileMore(){ document.querySelector('#fmx-mobile-more')?.remove(); }

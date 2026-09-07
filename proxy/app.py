@@ -2407,6 +2407,32 @@ async def ext_resolve_track_source(request: Request):
         current.update(await _online_info(request, guid) or {})
         title = str(current.get("title") or current.get("name") or "").strip()
         artist = str(current.get("artist") or "").strip()
+    if not title and guid and not is_online_guid(guid):
+        # Cached online files are rescanned by fnOS and receive a normal local
+        # GUID. Native clients still expect the source button to work for them.
+        try:
+            response = await get_upstream_client(request.app).get(
+                "/music/api/v1/track/metadata",
+                params={"guid": guid},
+                headers=copy_incoming_headers(request),
+                timeout=10.0,
+            )
+            payload = response.json() if response.status_code == 200 else {}
+            data = payload.get("data") if isinstance(payload, dict) else {}
+            track = data.get("track") if isinstance(data, dict) and isinstance(data.get("track"), dict) else data
+            if isinstance(track, dict):
+                title = str(track.get("title") or track.get("name") or "").strip()
+                artists = track.get("artists")
+                if isinstance(artists, list):
+                    artist = " / ".join(
+                        str(item.get("name") or "")
+                        for item in artists
+                        if isinstance(item, dict) and item.get("name")
+                    ).strip()
+                if not artist:
+                    artist = str(track.get("artist") or "").strip()
+        except Exception as exc:
+            logger.warning("failed to resolve local track metadata for source switch: %s", exc)
     if not title:
         raise HTTPException(status_code=400, detail="无法识别当前歌曲")
 

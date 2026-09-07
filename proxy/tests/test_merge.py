@@ -285,6 +285,49 @@ def test_resolve_current_track_to_qqmusic(monkeypatch):
     assert payload["sourceName"] == "QQ音乐"
 
 
+def test_resolve_rescanned_local_track_to_online_source(monkeypatch):
+    """A cached online file rescanned with a local GUID can still switch source."""
+    monkeypatch.setitem(CONF, "qqmusic_enabled", True)
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/music/api/v1/settings/server":
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        if request.url.path == "/music/api/v1/user/me":
+            return httpx.Response(200, json={"code": 0, "data": {"guid": "user-a"}})
+        if request.url.path == "/music/api/v1/track/metadata":
+            assert request.url.params.get("guid") == "local-rescanned-guid"
+            return httpx.Response(200, json={
+                "code": 0,
+                "data": {"track": {"title": "晴天", "artists": [{"name": "周杰伦"}]}},
+            })
+        return httpx.Response(404)
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler), base_url="http://unix"
+    )
+    app.state.qqmusic_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
+            "code": 0,
+            "data": {"item_song": [{
+                "mid": "qq-local-match",
+                "name": "晴天",
+                "singer": [{"name": "周杰伦"}],
+                "album": {"name": "叶惠美", "mid": "album1"},
+            }]},
+        })),
+        base_url="http://qqmusic",
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/music/api/v1/_ext/resolve-track-source",
+            json={"guid": "local-rescanned-guid", "source": "qqmusic"},
+            headers={"X-FnMusic-Ext": "1"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["track"]["guid"] == "online:qq:qq-local-match"
+
+
 def test_qq_qrcode_check_never_exposes_credential():
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(

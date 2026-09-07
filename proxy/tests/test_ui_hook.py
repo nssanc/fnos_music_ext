@@ -39,3 +39,7 @@ def test_extension_assets_include_mobile_layout_and_safe_areas():
     assert "--music-player-now-playing-player-left-width:100%" in script
     assert "[data-lyric-index]" in script
     assert "aria-label','在线音源设置'" in script
+    assert "lastObservedGuid" in script
+    assert "本地音乐" in script
+    assert "尚未识别当前歌曲" in script
+    assert "z-index:100002" in script
