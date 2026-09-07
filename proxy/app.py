@@ -1609,7 +1609,13 @@ async def resolve_lx_action(
 ) -> Any:
     if not source_enabled("lx"):
         return None
-    source = lx_source_key(str(item.get("source") or source_from_online_guid(guid)))
+    origin_source = str(
+        item.get("lx_origin_source")
+        or item.get("source")
+        or source_from_online_guid(guid)
+    )
+    source = lx_source_key(origin_source)
+    music_info = lx_music_info({**item, "source": origin_source}, guid)
     try:
         response = await get_lx_source_client(request.app).post(
             "/api/v1/resolve",
@@ -1617,7 +1623,7 @@ async def resolve_lx_action(
                 "source": source,
                 "action": action,
                 "quality": quality,
-                "musicInfo": lx_music_info(item, guid),
+                "musicInfo": music_info,
             },
             timeout=25.0,
         )
@@ -2369,7 +2375,7 @@ async def ext_source_preferences(request: Request):
     await require_ext_access(request, mutation=True)
     body = await request.json()
     allowed = {
-        "audioSource": {"auto", "qqmusic", "netease", "musicdl"},
+        "audioSource": {"auto", "qqmusic", "netease", "musicdl", "lx"},
         "lyricSource": {"auto", "same", "qqmusic", "netease", "musicdl", "lx"},
     }
     if not isinstance(body, dict) or not body:
@@ -2395,7 +2401,7 @@ async def ext_resolve_track_source(request: Request):
         raise HTTPException(status_code=400, detail="invalid request")
     guid = str(body.get("guid") or "").strip()
     provider = str(body.get("source") or "").strip().lower()
-    if provider not in {"qqmusic", "netease", "musicdl"}:
+    if provider not in {"qqmusic", "netease", "musicdl", "lx"}:
         raise HTTPException(status_code=400, detail="invalid source")
     if not source_enabled(provider):
         raise HTTPException(status_code=400, detail="该音乐源未启用")
@@ -2431,12 +2437,80 @@ async def ext_resolve_track_source(request: Request):
                     ).strip()
                 if not artist:
                     artist = str(track.get("artist") or "").strip()
+                current.update(track)
+                current["title"] = title
+                current["artist"] = artist
         except Exception as exc:
             logger.warning("failed to resolve local track metadata for source switch: %s", exc)
     if not title:
         raise HTTPException(status_code=400, detail="无法识别当前歌曲")
 
     keyword = " ".join(part for part in (title, artist) if part)
+    if provider == "lx":
+        # LX scripts resolve platform song IDs but do not provide a standalone
+        # metadata search API.  Retain the current online ID where possible;
+        # for a rescanned local cache, first recover a matching platform ID.
+        origin = dict(current)
+        origin_guid = guid
+        origin_source = str(origin.get("source") or source_from_online_guid(guid))
+        if lx_source_key(origin_source) == "local":
+            preferred = SOURCE_REGISTRY.preference("audioSource")
+            candidates = ["netease", "qqmusic", "musicdl"]
+            if preferred in candidates:
+                candidates.remove(preferred)
+                candidates.insert(0, preferred)
+            origin = {}
+            for candidate in candidates:
+                if not source_enabled(candidate):
+                    continue
+                tracks = await search_source_tracks(request, candidate, keyword, 12)
+                match = _pick_lyric_match(tracks, title, artist)
+                if match and lx_source_key(str(match.get("source") or candidate)) != "local":
+                    origin = dict(match)
+                    origin_guid = online_guid_from_item(match)
+                    origin_source = str(match.get("source") or candidate)
+                    break
+        if not origin or lx_source_key(origin_source) == "local":
+            raise HTTPException(status_code=404, detail="洛雪需要先匹配到歌曲的平台 ID")
+        origin_id = str(
+            origin.get("qq_mid")
+            or origin.get("id")
+            or song_id_from_online_guid(origin_guid).split(":")[-1]
+        )
+        play_url = await resolve_lx_action(
+            request,
+            origin_guid,
+            {
+                **origin,
+                "source": origin_source,
+                "lx_music_id": origin_id,
+            },
+            quality="flac",
+        )
+        if not isinstance(play_url, str) or not play_url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=404, detail="已启用的洛雪源无法解析这首歌")
+        token = uuid4().hex
+        lx_item = {
+            **origin,
+            "id": token,
+            "source": "lx",
+            "title": title,
+            "artist": artist,
+            "play_url": play_url,
+            "lx_origin_guid": origin_guid,
+            "lx_origin_source": origin_source,
+            "lx_music_id": origin_id,
+            "ext": origin.get("ext") or "flac",
+        }
+        track = build_online_track(lx_item)
+        return {
+            "ok": True,
+            "track": track,
+            "streamUrl": f"/music/api/v1/track/stream?guid={quote(track['guid'], safe='')}",
+            "source": "lx",
+            "sourceName": source_label("lx"),
+        }
+
     tracks = await search_source_tracks(request, provider, keyword, 12)
     match = _pick_lyric_match(tracks, title, artist)
     if not match:
@@ -3375,6 +3449,37 @@ async def stream_track(request: Request, subpath: str = ""):
 
     src = source_from_online_guid(guid)
     cached_info = _ONLINE_ENTITY_CACHE.get(guid)
+    if SOURCE_REGISTRY.preference("audioSource") == "lx" and src != "lx":
+        info = cached_info or await _online_info(request, guid) or {}
+        lx_url = await resolve_lx_action(request, guid, info, quality="flac")
+        if isinstance(lx_url, str) and lx_url.startswith(("http://", "https://")):
+            return await stream_direct_online(
+                request,
+                guid,
+                lx_url,
+                range_header,
+                info,
+                str(info.get("ext") or "flac"),
+                allow_full_fallback=False,
+            )
+    if src == "lx":
+        info = cached_info or {}
+        play_url = str(info.get("play_url") or "")
+        if not play_url.startswith(("http://", "https://")):
+            return JSONResponse(
+                content={"code": 404, "msg": "LX source URL expired; switch source again", "data": None},
+                status_code=404,
+            )
+        return await stream_direct_online(
+            request,
+            guid,
+            play_url,
+            range_header,
+            info,
+            str(info.get("ext") or "flac"),
+            allow_full_fallback=False,
+        )
+
     if src == "qq":
         song_mid = song_id_from_online_guid(guid).split(":")[-1]
         play_url, resolved_ext, file_size = await resolve_qq_url(

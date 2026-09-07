@@ -1,4 +1,5 @@
 """Tests for fnmusic-ext proxy (search merge, streaming tee cache, passthrough)."""
+import json
 import os
 import pytest
 import httpx
@@ -283,6 +284,56 @@ def test_resolve_current_track_to_qqmusic(monkeypatch):
     assert payload["track"]["guid"] == "online:qq:qqmid"
     assert "online%3Aqq%3Aqqmid" in payload["streamUrl"]
     assert payload["sourceName"] == "QQ音乐"
+
+
+def test_resolve_current_track_to_lx_source(monkeypatch):
+    monkeypatch.setitem(CONF, "lx_source_enabled", True)
+    _ONLINE_ENTITY_CACHE["online:netease:123"] = {
+        "id": "123",
+        "source": "netease",
+        "title": "晴天",
+        "artist": "周杰伦",
+        "album": "叶惠美",
+        "duration_s": 269,
+        "cover_url": "https://img.example/cover.jpg",
+    }
+
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"code": 0, "data": {}})),
+        base_url="http://unix",
+    )
+
+    def lx_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["source"] == "wy"
+        assert body["action"] == "musicUrl"
+        assert body["musicInfo"]["id"] == "123"
+        return httpx.Response(200, json={
+            "ok": True,
+            "sourceId": "lx-script-1",
+            "value": "https://lx.example/song.flac",
+        })
+
+    app.state.lx_source_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lx_handler), base_url="http://lx-source"
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/music/api/v1/_ext/resolve-track-source",
+            json={"guid": "online:netease:123", "source": "lx"},
+            headers={"X-FnMusic-Ext": "1"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["track"]["guid"].startswith("online:lx:")
+    assert payload["track"]["title"] == "晴天"
+    assert payload["track"]["coverUrl"] == "https://img.example/cover.jpg"
+    assert payload["sourceName"] == "洛雪"
+    cached = _ONLINE_ENTITY_CACHE[payload["track"]["guid"]]
+    assert cached["play_url"] == "https://lx.example/song.flac"
+    assert cached["lx_origin_source"] == "netease"
+    assert cached["lx_music_id"] == "123"
 
 
 def test_resolve_rescanned_local_track_to_online_source(monkeypatch):

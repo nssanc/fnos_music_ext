@@ -96,7 +96,12 @@ def lx_source_key(source: str) -> str:
 
 def lx_music_info(item: dict, guid: str) -> dict:
     """Expose common LX field aliases because scripts vary by platform/source."""
-    raw_id = str(item.get("qq_mid") or item.get("id") or guid.split(":")[-1])
+    raw_id = str(
+        item.get("lx_music_id")
+        or item.get("qq_mid")
+        or item.get("id")
+        or guid.split(":")[-1]
+    )
     if ":" in raw_id:
         raw_id = raw_id.rsplit(":", 1)[-1]
     title = str(item.get("title") or item.get("name") or "")
