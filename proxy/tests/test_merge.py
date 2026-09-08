@@ -298,6 +298,44 @@ def test_resolve_current_track_to_qqmusic(monkeypatch):
     assert payload["sourceName"] == "QQ音乐"
 
 
+def test_resolve_source_strips_rendered_album_and_source_badge(monkeypatch):
+    monkeypatch.setitem(CONF, "qqmusic_enabled", True)
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"code": 0, "data": {}})
+        ),
+        base_url="http://unix",
+    )
+    searched = []
+
+    def qq_handler(request: httpx.Request) -> httpx.Response:
+        searched.append(json.loads(request.content)["keyword"])
+        return httpx.Response(200, json={"code": 0, "data": {"body": {"item_song": [{
+            "mid": "qq-beauty",
+            "name": "Beauty And A Beat",
+            "singer": [{"name": "Justin Bieber"}, {"name": "Nicki Minaj"}],
+            "album": {"name": "Believe (Deluxe Edition)", "mid": "album1"},
+        }]}}})
+
+    app.state.qqmusic_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(qq_handler), base_url="http://qqmusic"
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/music/api/v1/_ext/resolve-track-source",
+            json={
+                "guid": "online:netease:beauty",
+                "title": "Beauty And A Beat",
+                "artist": "Justin Bieber, Nicki Minaj — Believe (Deluxe Edition) 〔网易云〕",
+                "source": "qqmusic",
+            },
+            headers={"X-FnMusic-Ext": "1"},
+        )
+    assert response.status_code == 200
+    assert response.json()["track"]["guid"] == "online:qq:qq-beauty"
+    assert searched[0] == "Beauty And A Beat Justin Bieber, Nicki Minaj"
+
+
 def test_resolve_current_track_to_lx_source(monkeypatch):
     monkeypatch.setitem(CONF, "lx_source_enabled", True)
     _ONLINE_ENTITY_CACHE["online:netease:123"] = {

@@ -1153,6 +1153,45 @@ def _pick_playback_match(
     return matches[0][4]
 
 
+def _clean_player_metadata(title: str, artist: str) -> tuple[str, str]:
+    """Remove fnOS display decorations before sending metadata to source search."""
+    source_badge = r"(?:网易云(?:音乐)?|QQ\s*音乐|酷我|咪咕|酷狗|洛雪(?:聚合|自定义源)?)"
+    clean_title = re.sub(
+        rf"\s*(?:〔{source_badge}〕|\[{source_badge}\])\s*$",
+        "",
+        str(title or ""),
+        flags=re.I,
+    ).strip()
+    clean_artist = re.sub(
+        rf"\s*(?:〔{source_badge}〕|\[{source_badge}\])\s*$",
+        "",
+        str(artist or ""),
+        flags=re.I,
+    ).strip()
+    # Some fnOS clients expose the rendered "artist — album 〔source〕" line as
+    # MediaSession.artist. The album part makes every otherwise exact match fail.
+    clean_artist = re.split(r"\s+[—–]\s+", clean_artist, maxsplit=1)[0].strip()
+    return clean_title, clean_artist
+
+
+def _pick_source_switch_match(items: list[dict], title: str, artist: str) -> dict | None:
+    """Prefer an exact artist match, but tolerate decorated client metadata."""
+    title, artist = _clean_player_metadata(title, artist)
+    exact = _pick_playback_match(items, title, artist)
+    if exact:
+        return exact
+    # Search results are relevance ordered. If a client supplied an incomplete
+    # artist, accept the first exact-title candidate instead of rejecting all.
+    compact = lambda value: re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").casefold())
+    wanted_title = compact(title)
+    if not wanted_title:
+        return None
+    for item in items:
+        if compact(item.get("title") or item.get("name")) == wanted_title:
+            return item
+    return None
+
+
 def response_media_size(headers: Any) -> int:
     content_range = str(headers.get("content-range") or "")
     matched = re.search(r"/(\d+)\s*$", content_range)
@@ -2604,6 +2643,7 @@ async def ext_resolve_track_source(request: Request):
     current = dict(_ONLINE_ENTITY_CACHE.get(guid) or {})
     title = str(body.get("title") or current.get("title") or current.get("name") or "").strip()
     artist = str(body.get("artist") or current.get("artist") or "").strip()
+    title, artist = _clean_player_metadata(title, artist)
     if not title and is_online_guid(guid):
         current.update(await _online_info(request, guid) or {})
         title = str(current.get("title") or current.get("name") or "").strip()
@@ -2637,6 +2677,7 @@ async def ext_resolve_track_source(request: Request):
                 current["artist"] = artist
         except Exception as exc:
             logger.warning("failed to resolve local track metadata for source switch: %s", exc)
+    title, artist = _clean_player_metadata(title, artist)
     if not title:
         raise HTTPException(status_code=400, detail="无法识别当前歌曲")
 
@@ -2659,7 +2700,10 @@ async def ext_resolve_track_source(request: Request):
                 if not source_enabled(candidate):
                     continue
                 tracks = await search_source_tracks(request, candidate, keyword, 12)
-                match = _pick_lyric_match(tracks, title, artist)
+                match = _pick_source_switch_match(tracks, title, artist)
+                if not match and artist:
+                    tracks = await search_source_tracks(request, candidate, title, 20)
+                    match = _pick_source_switch_match(tracks, title, artist)
                 if match and lx_source_key(str(match.get("source") or candidate)) != "local":
                     origin = dict(match)
                     origin_guid = online_guid_from_item(match)
@@ -2706,9 +2750,20 @@ async def ext_resolve_track_source(request: Request):
             "sourceName": source_label("lxsource"),
         }
 
-    tracks = await search_source_tracks(request, provider, keyword, 12)
-    match = _pick_lyric_match(tracks, title, artist)
+    tracks = await search_source_tracks(request, provider, keyword, 20)
+    match = _pick_source_switch_match(tracks, title, artist)
+    if not match and artist:
+        tracks = await search_source_tracks(request, provider, title, 30)
+        match = _pick_source_switch_match(tracks, title, artist)
     if not match:
+        logger.info(
+            "source switch miss provider=%s guid=%s title=%r artist=%r candidates=%d",
+            provider,
+            guid,
+            title,
+            artist,
+            len(tracks),
+        )
         raise HTTPException(status_code=404, detail="所选音乐源没有找到这首歌")
     resolved_guid = online_guid_from_item(match)
     _set_online_entity_cache(resolved_guid, {**match, "ts": time.time()})

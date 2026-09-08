@@ -28,7 +28,7 @@
     if (options.body && !(options.body instanceof FormData)) headers['Content-Type'] = 'application/json';
     const response = await fetch(API + path, { credentials: 'same-origin', ...options, headers });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || data.ok === false) throw new Error(data.error || data.message || `HTTP ${response.status}`);
+    if (!response.ok || data.ok === false) throw new Error(data.error || data.message || data.detail || `HTTP ${response.status}`);
     return data;
   }
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
