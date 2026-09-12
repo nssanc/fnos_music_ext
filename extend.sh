@@ -18,6 +18,25 @@ QQMUSIC_URL="http://127.0.0.1:8771"
 LX_SOURCE_URL="http://127.0.0.1:8772"
 LXMUSIC_URL="http://127.0.0.1:8773"
 INSTALL_MODE="auto"
+FORCE_RELOAD=0
+
+for arg in "$@"; do
+    case "${arg}" in
+        --force) FORCE_RELOAD=1 ;;
+        --qr)
+            curl -s http://127.0.0.1:8770/api/v1/auth/login/qr || true
+            exit 0
+            ;;
+        -h|--help)
+            echo "Usage: ./extend.sh [--force] [--qr]"
+            exit 0
+            ;;
+        *)
+            echo "unknown argument: ${arg}" >&2
+            exit 2
+            ;;
+    esac
+done
 
 log_info() {
     echo -e "\033[32m[INFO]\033[0m $*"
@@ -488,7 +507,7 @@ fi
 # 1.6 编译与语法检查
 python3 -m py_compile "${BASE_DIR}/proxy/app.py" "${BASE_DIR}/proxy/recommend.py" \
     "${BASE_DIR}/proxy/online_sources.py" "${BASE_DIR}/proxy/source_registry.py"
-bash -n "${BASE_DIR}/proxy/run_proxy.sh"
+bash -n "${BASE_DIR}/proxy/run_proxy.sh" "${BASE_DIR}/proxy/watchdog.sh"
 
 # ------------------------------------------------------------------------------
 # 2. 幂等性检查
