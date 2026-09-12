@@ -61,17 +61,18 @@ u_probe="$(probe_sock "${UPSTREAM_SOCK}")"
 echo "[run_proxy] probe TARGET=${t_probe} UPSTREAM=${u_probe}"
 
 if [ "${t_probe}" = "trim" ]; then
-    if [ "${u_probe}" != "none" ] && [ "${u_probe}" != "trim" ]; then
+    if [ "${u_probe}" = "trim" ]; then
+        # fnOS updates/restarts create a fresh official TARGET while the old
+        # official listener can still be reachable through UPSTREAM. The fresh
+        # TARGET is the upgraded backend and must replace the old saved inode.
+        echo "[run_proxy] TARGET 与 UPSTREAM 都是 trim-music，采用新建的 TARGET 作为上游"
+        rm -f "${UPSTREAM_SOCK}"
+    elif [ "${u_probe}" != "none" ]; then
         echo "[run_proxy] 清理非 trim 的 upstream 残留 (${u_probe})..."
         rm -f "${UPSTREAM_SOCK}"
     fi
-    if [ "${u_probe}" = "trim" ]; then
-        echo "[run_proxy] TARGET 与 UPSTREAM 都是 trim-music，保留 UPSTREAM，移除 TARGET 后接管"
-        rm -f "${TARGET_SOCK}"
-    else
-        echo "[run_proxy] 执行 socket 接管: ${TARGET_SOCK} -> ${UPSTREAM_SOCK}"
-        mv "${TARGET_SOCK}" "${UPSTREAM_SOCK}"
-    fi
+    echo "[run_proxy] 执行 socket 接管: ${TARGET_SOCK} -> ${UPSTREAM_SOCK}"
+    mv "${TARGET_SOCK}" "${UPSTREAM_SOCK}"
 elif [ "${u_probe}" = "trim" ]; then
     echo "[run_proxy] UPSTREAM 已是 trim-music，仅替换代理 socket"
     if [ "${t_probe}" != "none" ]; then

@@ -140,6 +140,7 @@ fi
 
 # 2. 停用并禁用代理服务
 log_info "停用并禁用 fnmusic-ext systemd 服务..."
+sudo systemctl disable --now fnmusic-ext-watch.timer 2>/dev/null || true
 sudo systemctl disable --now fnmusic-ext.service 2>/dev/null || true
 
 # 4. Socket 复位逻辑（绝不误删官方活 socket）
@@ -237,6 +238,8 @@ if [ -f "/etc/systemd/system/fnmusic-ext.service" ]; then
     log_info "移除 /etc/systemd/system/fnmusic-ext.service..."
     sudo rm -f "/etc/systemd/system/fnmusic-ext.service"
 fi
+sudo rm -f /etc/systemd/system/fnmusic-ext-watch.service \
+    /etc/systemd/system/fnmusic-ext-watch.timer
 sudo systemctl daemon-reload 2>/dev/null || true
 
 log_info "============================================================"

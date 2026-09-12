@@ -97,7 +97,7 @@ git clone https://github.com/nssanc/fnos_music_ext.git fnmusic_ext
 cd fnmusic_ext
 
 # 3. 赋予必要脚本执行权限
-chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
+chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh proxy/watchdog.sh
 ```
 
 *(注：如果因网络原因无法直接从 GitHub 克隆，可下载 Zip 压缩包上传至 NAS 并解压进入对应目录)*
@@ -335,6 +335,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 - **官方服务自愈保障**：当系统重启，或者管理员执行 `systemctl restart trim-music` 重启官方服务时，官方 Go 二进制的初始化逻辑会主动 `unlink` 原生路径 `/var/run/trim_music.socket` 并重新创建绑定。
 - **天然保底**：此时，即使扩展代理服务尚未启动或异常退出，nginx 的请求也会直接流入官方 Go 后端，系统自动恢复为飞牛出厂的原生直连状态，**绝对不会因为扩展代理异常而导致用户本地音乐无法播放**。
 - **智能幂等再接管**：扩展代理的启动守护脚本 `run_proxy.sh` 具备状态感知与探针能力。每次启动时会自动检测原位 socket 与 upstream socket 的归属与健康状态，仅在检测到官方后端健康就绪时平滑重命名并安全接管。
+- **飞牛更新后自动恢复**：`fnmusic-ext-watch.timer` 每分钟检查页面入口与 socket 归属。飞牛音乐升级覆盖入口或重建官方 socket 后，会自动采用新版本官方后端、恢复入口并重新接管，无需再次完整安装。
 
 ---
 
@@ -546,6 +547,7 @@ fnmusic_ext/
 │   ├── app.py                 # FastAPI 代理
 │   ├── recommend.py           # 每日推荐（LLM + 检索）
 │   ├── run_proxy.sh
+│   ├── watchdog.sh
 │   ├── requirements.txt
 │   └── tests/
 ├── musicdl-service/           # CharlesPikachu/musicdl HTTP 包装 (:8768)
@@ -645,7 +647,7 @@ fnmusic_ext/
 
 ```bash
 # 赋予脚本执行权限
-chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
+chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh proxy/watchdog.sh
 
 # 交互式向导安装（新手首选：按提示选择模式、音源及每日推荐）
 ./install.sh
@@ -789,7 +791,7 @@ rm -rf ./cache/*
 
 ```bash
 # 1. Shell 脚本语法检查
-bash -n extend.sh restore.sh install.sh proxy/run_proxy.sh
+bash -n extend.sh restore.sh install.sh proxy/run_proxy.sh proxy/watchdog.sh
 
 # 2. Python 语法编译检查
 python3 -m py_compile proxy/app.py proxy/recommend.py

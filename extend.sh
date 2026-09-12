@@ -538,7 +538,40 @@ WantedBy=multi-user.target
 EOF
 sudo cp "${UNIT_TMP}" /etc/systemd/system/fnmusic-ext.service
 rm -f "${UNIT_TMP}"
+
+WATCH_UNIT_TMP="$(mktemp)"
+cat > "${WATCH_UNIT_TMP}" <<EOF
+[Unit]
+Description=fnmusic-ext Repair After fnOS Music Updates
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=${BASE_DIR}
+ExecStart=${BASE_DIR}/proxy/watchdog.sh
+EOF
+sudo cp "${WATCH_UNIT_TMP}" /etc/systemd/system/fnmusic-ext-watch.service
+rm -f "${WATCH_UNIT_TMP}"
+
+WATCH_TIMER_TMP="$(mktemp)"
+cat > "${WATCH_TIMER_TMP}" <<'EOF'
+[Unit]
+Description=Periodically verify fnmusic-ext integration
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+sudo cp "${WATCH_TIMER_TMP}" /etc/systemd/system/fnmusic-ext-watch.timer
+rm -f "${WATCH_TIMER_TMP}"
 sudo systemctl daemon-reload
+sudo systemctl enable --now fnmusic-ext-watch.timer
 
 if systemctl is-active --quiet fnmusic-ext.service 2>/dev/null; then
     log_info "重启 fnmusic-ext 服务..."
